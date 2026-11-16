@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   Plus,
   Trash2,
@@ -208,6 +208,262 @@ const initialTreeData = [
   }
 ];
 
+// Single mind-map node. Memoized so that panning, typing in another node, or
+// selecting something else doesn't re-render every node on the canvas.
+// Handlers read the latest App state/functions through `ctx` (a ref) at click time.
+const MapNodeBase = ({ coords, isSelected, isEditing, isDragOver, isMatch, editingText, draggedNodeId, ctx, nodeRefs }: any) => {
+  const node = coords.data;
+  const palette = COLOR_PALETTE[node.colorIndex] || COLOR_PALETTE[1];
+  const { x, y, width, height } = coords;
+
+  const textLen = Math.max((node.text || '').length, 1);
+  const innerWidth = Math.max(40, width - (node.emoji ? 44 : 24));
+  const innerHeight = Math.max(20, height - 14);
+  const autoFontSize = Math.max(
+    11,
+    Math.min(Math.floor(Math.min(Math.sqrt((innerWidth * innerHeight * 1.2) / textLen), innerHeight * 0.55)), 48)
+  );
+  const calculatedFontSize = node.fontSize || autoFontSize;
+
+  const bgStyle = node.customColor
+    ? { backgroundColor: node.customColor, borderColor: 'rgba(255,255,255,0.4)' }
+    : {};
+  const bgClasses = node.customColor ? '' : `${palette.bg} ${palette.border}`;
+
+  return (
+      <div
+        key={node.id}
+        ref={(el) => (nodeRefs.current[node.id] = el)}
+        style={{
+          left: `${x}px`,
+          top: `${y}px`,
+          width: `${width}px`,
+          height: `${height}px`,
+          ...bgStyle
+        }}
+        onClick={(e) => {
+          e.stopPropagation();
+          ctx.current.setSelectedNodeId(node.id);
+          ctx.current.setSelectedStickyId(null);
+          ctx.current.setOpenStickyColorId(null);
+        }}
+        onDoubleClick={(e) => {
+          e.stopPropagation();
+          ctx.current.setSelectedNodeId(node.id);
+          ctx.current.setEditingText(node.text);
+          ctx.current.setEditingNodeId(node.id);
+        }}
+        onMouseDown={(e) => {
+          e.stopPropagation();
+          ctx.current.setSelectedNodeId(node.id);
+          if (!node.isLocked) {
+            ctx.current.setDraggingNodeId(node.id);
+            ctx.current.setDragStartPos({ x: e.clientX, y: e.clientY });
+            ctx.current.setInitialNodeOffset({ x: node.xOffset || 0, y: node.yOffset || 0 });
+          }
+        }}
+        draggable={!isEditing && !node.isLocked}
+        onDragStart={(e) => {
+          if (node.isLocked) {
+            e.preventDefault();
+            return;
+          }
+          e.stopPropagation();
+          ctx.current.setDraggedNodeId(node.id);
+        }}
+        onDragOver={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          if (draggedNodeId && draggedNodeId !== node.id) {
+            ctx.current.setDragOverNodeId(node.id);
+          }
+        }}
+        onDragLeave={() => ctx.current.setDragOverNodeId(null)}
+        onDrop={(e) => {
+          e.preventDefault();
+          if (draggedNodeId && draggedNodeId !== node.id) {
+            const moveNode = (nodes, sourceId, targetParentId) => {
+              let nodeToMove = null;
+              const filterTree = (list) => {
+                return list
+                  .map((n) => {
+                    if (n.id === sourceId) {
+                      nodeToMove = n;
+                      return null;
+                    }
+                    if (n.children) {
+                      return {
+                        ...n,
+                        children: filterTree(n.children).filter(Boolean)
+                      };
+                    }
+                    return n;
+                  })
+                  .filter(Boolean);
+              };
+
+              const cleanedTree = filterTree(nodes);
+              if (!nodeToMove) return nodes;
+
+              const appendToTarget = (list) => {
+                return list.map((n) => {
+                  if (n.id === targetParentId) {
+                    return {
+                      ...n,
+                      expanded: true,
+                      children: [...(n.children || []), nodeToMove]
+                    };
+                  }
+                  if (n.children) {
+                    return {
+                      ...n,
+                      children: appendToTarget(n.children)
+                    };
+                  }
+                  return n;
+                });
+              };
+
+              return appendToTarget(cleanedTree);
+            };
+
+            const newTree = moveNode(ctx.current.rootNodes, draggedNodeId, node.id);
+            ctx.current.updateTree(newTree);
+          }
+          ctx.current.setDraggedNodeId(null);
+          ctx.current.setDragOverNodeId(null);
+        }}
+        className={`absolute pointer-events-auto rounded-2xl border-2 shadow-xl flex items-center justify-between px-3 py-1.5 transition-[background-color,border-color,box-shadow,transform,scale,opacity] duration-150 cursor-pointer ${bgClasses} ${
+          isSelected ? 'ring-4 ring-indigo-400 ring-offset-2 ring-offset-slate-950 scale-105 z-20' : 'hover:scale-102 z-10'
+        } ${isDragOver ? 'ring-4 ring-emerald-400 scale-105' : ''} ${
+          isMatch ? 'ring-4 ring-amber-400 animate-pulse' : ''
+        }`}
+      >
+        <div className="flex items-center justify-center gap-1.5 w-full h-full overflow-hidden text-center">
+          {node.isLocked && (
+            <Lock className="w-3 h-3 text-rose-300 flex-shrink-0" title="Position Locked" />
+          )}
+          {node.emoji && (
+            <span
+              className="flex-shrink-0 select-none"
+              style={{ fontSize: `${Math.max(12, calculatedFontSize * 1.1)}px` }}
+            >
+              {node.emoji}
+            </span>
+          )}
+
+          {isEditing ? (
+            <input
+              type="text"
+              value={editingText}
+              autoFocus
+              onFocus={(e) => e.target.select()}
+              onChange={(e) => ctx.current.setEditingText(e.target.value)}
+              onBlur={() => ctx.current.saveNodeText(node.id)}
+              onKeyDown={(e) => {
+                e.stopPropagation();
+                if (e.key === 'Enter') {
+                  ctx.current.saveNodeText(node.id);
+                } else if (e.key === 'Escape') {
+                  ctx.current.setEditingNodeId(null);
+                }
+              }}
+              className="bg-transparent border-b-2 border-white text-white font-bold outline-none text-center w-full px-1"
+              style={{ fontSize: `${calculatedFontSize}px` }}
+            />
+          ) : (
+            <span
+              className={`font-semibold text-white tracking-wide leading-tight line-clamp-2 select-none w-full text-center ${
+                node.isSmall ? 'text-xs' : ''
+              }`}
+              style={{
+                fontSize: `${calculatedFontSize}px`,
+                wordBreak: 'break-word',
+                hyphens: 'auto'
+              }}
+            >
+              {node.text}
+            </span>
+          )}
+
+          {/* Note Badge Indicator */}
+          {(node.note || (node.images && node.images.length > 0)) && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                ctx.current.setNoteText(node.note || '');
+                ctx.current.setNoteImages(node.images || []);
+                ctx.current.setEditingNoteNodeId(node.id);
+              }}
+              className="flex-shrink-0 text-amber-300 hover:text-amber-100 transition flex items-center gap-0.5"
+              title={node.note || 'Contains images'}
+            >
+              <FileText className={node.isSmall ? 'w-2.5 h-2.5' : 'w-3.5 h-3.5'} />
+              {node.images && node.images.length > 0 && (
+                <span className="text-[9px] font-bold px-1 bg-amber-500/80 rounded-full text-slate-900">
+                  {node.images.length}
+                </span>
+              )}
+            </button>
+          )}
+        </div>
+
+        {/* Expand / Collapse Button */}
+        {node.children && node.children.length > 0 && (
+          <button
+            onClick={(e) => ctx.current.toggleExpand(node.id, e)}
+            className="ml-0.5 p-0.5 rounded-full hover:bg-white/20 transition text-slate-200 flex-shrink-0 self-center"
+            title={node.expanded ? 'Collapse Branch' : 'Expand Branch'}
+          >
+            {node.expanded ? (
+              <ChevronDown className={node.isSmall ? 'w-2.5 h-2.5' : 'w-3.5 h-3.5'} />
+            ) : (
+              <div className="flex items-center gap-0.5">
+                <ChevronRight className={node.isSmall ? 'w-2.5 h-2.5' : 'w-3.5 h-3.5'} />
+                <span className="text-[9px] font-bold px-1 bg-indigo-500/80 rounded-full">
+                  {node.children.length}
+                </span>
+              </div>
+            )}
+          </button>
+        )}
+
+        {/* Resizing Handle */}
+        {isSelected && (
+          <div
+            onMouseDown={(e) => {
+              e.stopPropagation();
+              ctx.current.setResizingNodeId(node.id);
+              ctx.current.setResizeStart({
+                w: node.width || (node.isSmall ? 100 : 160),
+                h: node.height || (node.isSmall ? 32 : 42),
+                x: e.clientX,
+                y: e.clientY
+              });
+            }}
+            className="absolute bottom-0 right-0 w-3.5 h-3.5 cursor-nwse-resize bg-indigo-400 rounded-br-xl rounded-tl-sm hover:scale-125 transition-transform"
+            title="Drag to resize node"
+          />
+        )}
+      </div>
+  );
+};
+
+const areNodePropsEqual = (a: any, b: any) =>
+  a.coords.x === b.coords.x &&
+  a.coords.y === b.coords.y &&
+  a.coords.width === b.coords.width &&
+  a.coords.height === b.coords.height &&
+  a.coords.data === b.coords.data &&
+  a.isSelected === b.isSelected &&
+  a.isEditing === b.isEditing &&
+  a.isDragOver === b.isDragOver &&
+  a.isMatch === b.isMatch &&
+  a.editingText === b.editingText &&
+  a.draggedNodeId === b.draggedNodeId;
+
+const MapNode = React.memo(MapNodeBase, areNodePropsEqual);
+
 export default function App() {
   // Multi-Tab Sheet State
   const [tabs, setTabs] = useState([
@@ -253,8 +509,9 @@ export default function App() {
 
   // Canvas & UI State
   const [transform, setTransform] = useState({ x: 80, y: 120, scale: 1 });
-  const [isPanning, setIsPanning] = useState(false);
-  const [panStart, setPanStart] = useState({ x: 0, y: 0 });
+  // Panning lives in refs so dragging the canvas never re-renders React
+  const panRef = useRef({ active: false, startX: 0, startY: 0, x: 0, y: 0, moved: false });
+  const canvasLayerRef = useRef(null);
   const [darkMode, setDarkMode] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const [showColorPicker, setShowColorPicker] = useState(false);
@@ -848,6 +1105,17 @@ export default function App() {
     updateTree(newTree);
   };
 
+  // Writes the final pan position into React state once, when the drag ends
+  const commitPan = useCallback(() => {
+    const p = panRef.current;
+    if (!p.active) return;
+    p.active = false;
+    if (p.moved) {
+      p.moved = false;
+      setTransform((prev) => ({ ...prev, x: p.x, y: p.y }));
+    }
+  }, []);
+
   // Canvas Panning & Mouse Movement Handlers
   const handleMouseDown = (e) => {
     if (pendingPlacementMode && containerRef.current) {
@@ -870,18 +1138,26 @@ export default function App() {
       setSelectedNodeId(null);
       setSelectedStickyId(null);
       setOpenStickyColorId(null);
-      setIsPanning(true);
-      setPanStart({ x: e.clientX - transform.x, y: e.clientY - transform.y });
+      panRef.current = {
+        active: true,
+        startX: e.clientX - transform.x,
+        startY: e.clientY - transform.y,
+        x: transform.x,
+        y: transform.y,
+        moved: false
+      };
     }
   };
 
   const handleMouseMove = (e) => {
-    if (isPanning) {
-      setTransform((prev) => ({
-        ...prev,
-        x: e.clientX - panStart.x,
-        y: e.clientY - panStart.y
-      }));
+    if (panRef.current.active) {
+      const p = panRef.current;
+      p.x = e.clientX - p.startX;
+      p.y = e.clientY - p.startY;
+      p.moved = true;
+      if (canvasLayerRef.current) {
+        canvasLayerRef.current.style.transform = `translate(${p.x}px, ${p.y}px) scale(${transform.scale})`;
+      }
     } else if (draggingStickyId) {
       const targetSticky = stickyNotes.find((s) => s.id === draggingStickyId);
       if (targetSticky?.isPinned) return;
@@ -971,7 +1247,7 @@ export default function App() {
     if (draggingNodeId || resizingNodeId) {
       updateTree(rootNodes);
     }
-    setIsPanning(false);
+    commitPan();
     setDraggingNodeId(null);
     setResizingNodeId(null);
     setDraggingStickyId(null);
@@ -982,7 +1258,7 @@ export default function App() {
   // Ensure dragging/resizing cancels cleanly when mouse is released anywhere on screen
   useEffect(() => {
     const handleGlobalMouseUp = () => {
-      setIsPanning(false);
+      commitPan();
       setDraggingNodeId(null);
       setResizingNodeId(null);
       setDraggingStickyId(null);
@@ -992,7 +1268,7 @@ export default function App() {
 
     window.addEventListener('mouseup', handleGlobalMouseUp);
     return () => window.removeEventListener('mouseup', handleGlobalMouseUp);
-  }, []);
+  }, [commitPan]);
 
   const centerCanvas = () => {
     if (!containerRef.current) return;
@@ -1063,7 +1339,14 @@ export default function App() {
       }));
     }
   };
-
+  // Attach wheel as non-passive so preventDefault() actually works
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const onWheel = (e) => handleWheel(e);
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  });
   // JSON Import & Export
   const exportJSON = () => {
     const exportPayload = {
@@ -1275,7 +1558,7 @@ export default function App() {
     return { coords, lines };
   }, [rootNodes]);
 
-  const { coords: nodeCoords, lines } = calculateTreeLayout();
+  const { coords: nodeCoords, lines } = useMemo(() => calculateTreeLayout(), [calculateTreeLayout]);
 
   // Reset all free-drag offsets back to clean automatic tree alignment
   const resetAutoLayout = () => {
@@ -1288,6 +1571,18 @@ export default function App() {
       }));
     updateTree(clearOffsets(rootNodes));
   };
+
+  // Latest state/functions for the memoized MapNode handlers (read at click time)
+  const nodeCtx = useRef(null);
+  useEffect(() => {
+    nodeCtx.current = {
+      rootNodes, updateTree, saveNodeText, toggleExpand,
+      setSelectedNodeId, setSelectedStickyId, setOpenStickyColorId,
+      setEditingText, setEditingNodeId, setDraggingNodeId, setDragStartPos,
+      setInitialNodeOffset, setDraggedNodeId, setDragOverNodeId,
+      setResizingNodeId, setResizeStart, setNoteText, setNoteImages, setEditingNoteNodeId
+    };
+  });
 
   // Search Filter Check
   const isSearchMatch = (node) => {
@@ -1488,7 +1783,6 @@ export default function App() {
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
-        onWheel={handleWheel}
         className={`flex-1 relative overflow-hidden ${
           pendingPlacementMode ? 'cursor-crosshair' : 'cursor-grab active:cursor-grabbing'
         } ${
@@ -1781,6 +2075,7 @@ export default function App() {
 
         {/* Scalable Container for SVG Connecting Lines & Nodes */}
         <div
+          ref={canvasLayerRef}
           style={{
             transform: `translate(${transform.x}px, ${transform.y}px) scale(${transform.scale})`,
             transformOrigin: '0 0'
@@ -1803,7 +2098,7 @@ export default function App() {
                   stroke={strokeColor}
                   strokeWidth="3"
                   strokeLinecap="round"
-                  className="transition-all duration-300 opacity-80 hover:opacity-100"
+                  className="transition-opacity duration-300 opacity-80 hover:opacity-100"
                 />
               );
             })}
@@ -1835,246 +2130,22 @@ export default function App() {
             )}
           </svg>
 
-          {/* Render All Nodes */}
+          {/* Render All Nodes (memoized) */}
           {Object.values(nodeCoords).map((coords) => {
-            const node = coords.data;
-            const isSelected = selectedNodeId === node.id;
-            const isEditing = editingNodeId === node.id;
-            const isDragOver = dragOverNodeId === node.id;
-            const isMatch = isSearchMatch(node);
-            const palette = COLOR_PALETTE[node.colorIndex] || COLOR_PALETTE[1];
-            const { x, y, width, height } = coords;
-
-            const textLen = Math.max((node.text || '').length, 1);
-            const innerWidth = Math.max(40, width - (node.emoji ? 44 : 24));
-            const innerHeight = Math.max(20, height - 14);
-            const autoFontSize = Math.max(
-              11,
-              Math.min(Math.floor(Math.min(Math.sqrt((innerWidth * innerHeight * 1.2) / textLen), innerHeight * 0.55)), 48)
-            );
-            const calculatedFontSize = node.fontSize || autoFontSize;
-
-            const bgStyle = node.customColor
-              ? { backgroundColor: node.customColor, borderColor: 'rgba(255,255,255,0.4)' }
-              : {};
-            const bgClasses = node.customColor ? '' : `${palette.bg} ${palette.border}`;
-
+            const nodeId = coords.data.id;
             return (
-              <div
-                key={node.id}
-                ref={(el) => (nodeRefs.current[node.id] = el)}
-                style={{
-                  left: `${x}px`,
-                  top: `${y}px`,
-                  width: `${width}px`,
-                  height: `${height}px`,
-                  ...bgStyle
-                }}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setSelectedNodeId(node.id);
-                  setSelectedStickyId(null);
-                  setOpenStickyColorId(null);
-                }}
-                onDoubleClick={(e) => {
-                  e.stopPropagation();
-                  setSelectedNodeId(node.id);
-                  setEditingText(node.text);
-                  setEditingNodeId(node.id);
-                }}
-                onMouseDown={(e) => {
-                  e.stopPropagation();
-                  setSelectedNodeId(node.id);
-                  if (!node.isLocked) {
-                    setDraggingNodeId(node.id);
-                    setDragStartPos({ x: e.clientX, y: e.clientY });
-                    setInitialNodeOffset({ x: node.xOffset || 0, y: node.yOffset || 0 });
-                  }
-                }}
-                draggable={!isEditing && !node.isLocked}
-                onDragStart={(e) => {
-                  if (node.isLocked) {
-                    e.preventDefault();
-                    return;
-                  }
-                  e.stopPropagation();
-                  setDraggedNodeId(node.id);
-                }}
-                onDragOver={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  if (draggedNodeId && draggedNodeId !== node.id) {
-                    setDragOverNodeId(node.id);
-                  }
-                }}
-                onDragLeave={() => setDragOverNodeId(null)}
-                onDrop={(e) => {
-                  e.preventDefault();
-                  if (draggedNodeId && draggedNodeId !== node.id) {
-                    const moveNode = (nodes, sourceId, targetParentId) => {
-                      let nodeToMove = null;
-                      const filterTree = (list) => {
-                        return list
-                          .map((n) => {
-                            if (n.id === sourceId) {
-                              nodeToMove = n;
-                              return null;
-                            }
-                            if (n.children) {
-                              return {
-                                ...n,
-                                children: filterTree(n.children).filter(Boolean)
-                              };
-                            }
-                            return n;
-                          })
-                          .filter(Boolean);
-                      };
-
-                      const cleanedTree = filterTree(nodes);
-                      if (!nodeToMove) return nodes;
-
-                      const appendToTarget = (list) => {
-                        return list.map((n) => {
-                          if (n.id === targetParentId) {
-                            return {
-                              ...n,
-                              expanded: true,
-                              children: [...(n.children || []), nodeToMove]
-                            };
-                          }
-                          if (n.children) {
-                            return {
-                              ...n,
-                              children: appendToTarget(n.children)
-                            };
-                          }
-                          return n;
-                        });
-                      };
-
-                      return appendToTarget(cleanedTree);
-                    };
-
-                    const newTree = moveNode(rootNodes, draggedNodeId, node.id);
-                    updateTree(newTree);
-                  }
-                  setDraggedNodeId(null);
-                  setDragOverNodeId(null);
-                }}
-                className={`absolute pointer-events-auto rounded-2xl border-2 shadow-xl flex items-center justify-between px-3 py-1.5 transition-all duration-150 cursor-pointer ${bgClasses} ${
-                  isSelected ? 'ring-4 ring-indigo-400 ring-offset-2 ring-offset-slate-950 scale-105 z-20' : 'hover:scale-102 z-10'
-                } ${isDragOver ? 'ring-4 ring-emerald-400 scale-105' : ''} ${
-                  isMatch ? 'ring-4 ring-amber-400 animate-pulse' : ''
-                }`}
-              >
-                <div className="flex items-center justify-center gap-1.5 w-full h-full overflow-hidden text-center">
-                  {node.isLocked && (
-                    <Lock className="w-3 h-3 text-rose-300 flex-shrink-0" title="Position Locked" />
-                  )}
-                  {node.emoji && (
-                    <span
-                      className="flex-shrink-0 select-none"
-                      style={{ fontSize: `${Math.max(12, calculatedFontSize * 1.1)}px` }}
-                    >
-                      {node.emoji}
-                    </span>
-                  )}
-
-                  {isEditing ? (
-                    <input
-                      type="text"
-                      value={editingText}
-                      autoFocus
-                      onFocus={(e) => e.target.select()}
-                      onChange={(e) => setEditingText(e.target.value)}
-                      onBlur={() => saveNodeText(node.id)}
-                      onKeyDown={(e) => {
-                        e.stopPropagation();
-                        if (e.key === 'Enter') {
-                          saveNodeText(node.id);
-                        } else if (e.key === 'Escape') {
-                          setEditingNodeId(null);
-                        }
-                      }}
-                      className="bg-transparent border-b-2 border-white text-white font-bold outline-none text-center w-full px-1"
-                      style={{ fontSize: `${calculatedFontSize}px` }}
-                    />
-                  ) : (
-                    <span
-                      className={`font-semibold text-white tracking-wide leading-tight line-clamp-2 select-none w-full text-center ${
-                        node.isSmall ? 'text-xs' : ''
-                      }`}
-                      style={{
-                        fontSize: `${calculatedFontSize}px`,
-                        wordBreak: 'break-word',
-                        hyphens: 'auto'
-                      }}
-                    >
-                      {node.text}
-                    </span>
-                  )}
-
-                  {/* Note Badge Indicator */}
-                  {(node.note || (node.images && node.images.length > 0)) && (
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setNoteText(node.note || '');
-                        setNoteImages(node.images || []);
-                        setEditingNoteNodeId(node.id);
-                      }}
-                      className="flex-shrink-0 text-amber-300 hover:text-amber-100 transition flex items-center gap-0.5"
-                      title={node.note || 'Contains images'}
-                    >
-                      <FileText className={node.isSmall ? 'w-2.5 h-2.5' : 'w-3.5 h-3.5'} />
-                      {node.images && node.images.length > 0 && (
-                        <span className="text-[9px] font-bold px-1 bg-amber-500/80 rounded-full text-slate-900">
-                          {node.images.length}
-                        </span>
-                      )}
-                    </button>
-                  )}
-                </div>
-
-                {/* Expand / Collapse Button */}
-                {node.children && node.children.length > 0 && (
-                  <button
-                    onClick={(e) => toggleExpand(node.id, e)}
-                    className="ml-0.5 p-0.5 rounded-full hover:bg-white/20 transition text-slate-200 flex-shrink-0 self-center"
-                    title={node.expanded ? 'Collapse Branch' : 'Expand Branch'}
-                  >
-                    {node.expanded ? (
-                      <ChevronDown className={node.isSmall ? 'w-2.5 h-2.5' : 'w-3.5 h-3.5'} />
-                    ) : (
-                      <div className="flex items-center gap-0.5">
-                        <ChevronRight className={node.isSmall ? 'w-2.5 h-2.5' : 'w-3.5 h-3.5'} />
-                        <span className="text-[9px] font-bold px-1 bg-indigo-500/80 rounded-full">
-                          {node.children.length}
-                        </span>
-                      </div>
-                    )}
-                  </button>
-                )}
-
-                {/* Resizing Handle */}
-                {isSelected && (
-                  <div
-                    onMouseDown={(e) => {
-                      e.stopPropagation();
-                      setResizingNodeId(node.id);
-                      setResizeStart({
-                        w: node.width || (node.isSmall ? 100 : 160),
-                        h: node.height || (node.isSmall ? 32 : 42),
-                        x: e.clientX,
-                        y: e.clientY
-                      });
-                    }}
-                    className="absolute bottom-0 right-0 w-3.5 h-3.5 cursor-nwse-resize bg-indigo-400 rounded-br-xl rounded-tl-sm hover:scale-125 transition-transform"
-                    title="Drag to resize node"
-                  />
-                )}
-              </div>
+              <MapNode
+                key={nodeId}
+                coords={coords}
+                isSelected={selectedNodeId === nodeId}
+                isEditing={editingNodeId === nodeId}
+                isDragOver={dragOverNodeId === nodeId}
+                isMatch={isSearchMatch(coords.data)}
+                editingText={editingNodeId === nodeId ? editingText : ''}
+                draggedNodeId={draggedNodeId}
+                ctx={nodeCtx}
+                nodeRefs={nodeRefs}
+              />
             );
           })}
 
@@ -2105,7 +2176,7 @@ export default function App() {
                   e.stopPropagation();
                   toggleStickyZoomEnlarge(sticky);
                 }}
-                className={`absolute pointer-events-auto rounded-xl border-2 shadow-2xl flex flex-col transition-all duration-200 ${
+                className={`absolute pointer-events-auto rounded-xl border-2 shadow-2xl flex flex-col transition-[background-color,border-color,box-shadow,transform,scale,opacity] duration-200 ${
                   isSelected ? 'ring-4 ring-indigo-500/80 z-30' : 'z-20'
                 }`}
               >
