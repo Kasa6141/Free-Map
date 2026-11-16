@@ -2,7 +2,7 @@
   "name": "freemap",
   "description": "FreeMap mind map app",
   "author": "Nefe@Syafiq",
-  "version": "0.0.1",
+  "version": "0.0.3",
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "vite",
