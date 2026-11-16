@@ -1,11 +1,11 @@
 # Free-Map
 I've always wondered why no one is able to create a free and working Mind Map with robust functionality without all the hassle of ads and/or trackers - So, like any typical person would do at this current age, I created this straight-forward application and provide some extra functionality to my app which then allow me to jot down what I need in a rather easy way with some additional info attach to them, so I can view them easily. The application work locally on any-working pc as is, and everything can be stored locally on your device!
 
-(Note: I should be able to sync the saved project onto any of your choosing cloud based storage like gdrive for example, but the integration I have on right now is not working properly and I sincerely have no clue how to fix it at the moment xD)
+(Note: I should be able to sync the saved project onto any of your choosing cloud based storage like gdrive for example, but the integration I have on right now is not working properly and I sincerely have no clue how to fix it at the moment xD).
 
 This would definitely works great for high school student or college student for any kind of work really - It works for me as it helps me keep certain data I need in a neat & quick fashion.
 
-Some of the functionality that I add into the application should improve most of any office worker or anyone really, who need some other way to input their thinking or any info into words or images, or even videos! (Soon to be added, the size of each videos can take a lot of space and not soo convenient in the long run)
+Some of the functionality that I add into the application should improve most of any office worker or anyone really, who need some other way to input their thinking or any info into words or images, or even videos! (Soon to be added, the size of each videos can take a lot of space and not soo convenient in the long run).
 
 <img width="1919" height="1031" alt="image" src="https://github.com/user-attachments/assets/38fbb8ab-920b-43cc-b263-df2be8f77007" />
 
@@ -19,14 +19,14 @@ There are tools that provide more insight to what you can do with the node itsel
 
 
 
-You can also lock the position of each node easily as well as moving it around while keeping the rest of the node in position
+You can also lock the position of each node easily as well as moving it around while keeping the rest of the node in position.
 
 
 
 <img width="1000" height="371" alt="image" src="https://github.com/user-attachments/assets/bd50d903-db9b-4eed-a57f-4d84602b744d" />
 
 
-Changing color for the node is also easily accessible within the overlay, You can also manually set the color or pick one of the preset; while at it why not change icon of each node to fit your need (I might add more icon later if needed, or the ability to add your own icon)
+Changing color for the node is also easily accessible within the overlay, You can also manually set the color or pick one of the preset; while at it why not change the icon of each node to fit your need (I might add more icon later if needed, or the ability to add your own icon).
 
 <img width="990" height="505" alt="image" src="https://github.com/user-attachments/assets/fa0d3b2e-4c0b-4400-b907-f0c97c492a56" />
 
@@ -36,7 +36,7 @@ Changing color for the node is also easily accessible within the overlay, You ca
 
 <img width="977" height="510" alt="image" src="https://github.com/user-attachments/assets/7fa6cde9-6abb-4e9a-8313-55cf1a7e679a" />
 
-You can also write additional note to each of the node if you wanted to, as well as upload your own images
+You can also write additional note to each of the node if you wanted to, as well as upload your own images.
 
 <img width="548" height="378" alt="image" src="https://github.com/user-attachments/assets/a82ea8ba-69d3-4106-a6ac-06251b670b26" />
 
