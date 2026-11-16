@@ -1,5 +1,7 @@
 # Free-Map
-I've always wondered why no one is able to create a free and working Mind Map with robust functionality - So, like any typical person would do at this current age, I created this straight-forward application and provide some extra functionality to my app which then allow me to jot down what I need in a rather easy way with some additional info attach to them, so I can view them easily.
+I've always wondered why no one is able to create a free and working Mind Map with robust functionality without all the hassle of ads and/or trackers - So, like any typical person would do at this current age, I created this straight-forward application and provide some extra functionality to my app which then allow me to jot down what I need in a rather easy way with some additional info attach to them, so I can view them easily. The application work locally on any-working pc as is, and everything can be stored locally on your device!
+
+(Note: I should be able to sync the saved project onto any of your choosing cloud based storage like gdrive for example, but the integration I have on right now is not working properly and I sincerely have no clue how to fix it at the moment xD)
 
 This would definitely works great for high school student or college student for any kind of work really - It works for me as it helps me keep certain data I need in a neat & quick fashion.
 
