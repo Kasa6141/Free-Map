@@ -3,7 +3,7 @@ I've always wondered why no one is able to create a free and working Mind Map wi
 
 This would definitely works great for high school student or college student for any kind of work really - It works for me as it helps me keep certain data I need in a neat & quick fashion.
 
-Some of the functionality that I add into the application should improve most of any office worker or anyone really, who need some other way to input their thinking or any info into words or images.
+Some of the functionality that I add into the application should improve most of any office worker or anyone really, who need some other way to input their thinking or any info into words or images, or even videos!
 
 <img width="1919" height="1031" alt="image" src="https://github.com/user-attachments/assets/38fbb8ab-920b-43cc-b263-df2be8f77007" />
 
