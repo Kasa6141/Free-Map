@@ -1031,6 +1031,13 @@ export default function App() {
         ...prev,
         scale: newScale
       }));
+	useEffect(() => {
+  const el = containerRef.current;
+  if (!el) return;
+  const onWheel = (e) => handleWheel(e);
+  el.addEventListener('wheel', onWheel, { passive: false });
+  return () => el.removeEventListener('wheel', onWheel);
+});  
     }
   };
 
@@ -1422,7 +1429,6 @@ export default function App() {
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
-        onWheel={handleWheel}
         className={`flex-1 relative overflow-hidden cursor-grab active:cursor-grabbing ${
           darkMode ? 'bg-slate-950' : 'bg-slate-50'
         }`}

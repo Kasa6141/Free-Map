@@ -289,6 +289,9 @@ export default function App() {
   const [openStickyColorId, setOpenStickyColorId] = useState(null);
   const [expandedStickyAttachment, setExpandedStickyAttachment] = useState(null); // { stickyId, type: 'image' | 'pdf', index: number }
 
+  // Click-to-place mode state ('parentNode' | 'stickyNote' | null)
+  const [pendingPlacementMode, setPendingPlacementMode] = useState(null);
+
   const updateStickyNote = (id, updates) => {
     setStickyNotes((prev) =>
       prev.map((s) => (s.id === id ? { ...s, ...updates } : s))
@@ -415,17 +418,20 @@ export default function App() {
   };
 
   // Sticky Note Actions
-  const addStickyNote = () => {
+  const addStickyNote = (customCoords = null) => {
     const rect = containerRef.current?.getBoundingClientRect();
     const centerX = rect ? (rect.width / 2 - transform.x) / transform.scale - 100 : 120;
     const centerY = rect ? (rect.height / 2 - transform.y) / transform.scale - 90 : 120;
     const offsetStagger = (stickyNotes.length % 6) * 24;
 
+    const targetX = customCoords ? customCoords.x - 105 : centerX + offsetStagger;
+    const targetY = customCoords ? customCoords.y - 20 : centerY + offsetStagger;
+
     const newSticky = {
       id: `sticky-${Date.now()}`,
       text: 'Write your sticky note here...',
-      x: centerX + offsetStagger,
-      y: centerY + offsetStagger,
+      x: targetX,
+      y: targetY,
       width: 210,
       height: 170,
       fontSize: 13,
@@ -577,16 +583,25 @@ export default function App() {
   };
 
   // Add new standalone parent node on the same tab
-  const addStandaloneParentNode = () => {
+  const addStandaloneParentNode = (customCoords = null) => {
     const newRootId = `root-${Date.now()}`;
+    const defaultTopY = rootNodes.reduce((acc, r) => {
+      const computeH = (n) => {
+        const h = n.height || (n.isSmall ? 32 : 42);
+        if (!n.expanded || !n.children || n.children.length === 0) return h + 16;
+        return Math.max(h + 16, n.children.reduce((s, c) => s + computeH(c), 0));
+      };
+      return acc + computeH(r) + 60;
+    }, 0);
+
     const newRootNode = {
       id: newRootId,
       text: 'New Topic Branch',
       emoji: '⭐',
       colorIndex: (rootNodes.length % (COLOR_PALETTE.length - 1)) + 1,
       expanded: true,
-      xOffset: 0,
-      yOffset: (rootNodes.length) * 220, // Stagger initial position
+      xOffset: customCoords ? customCoords.x - 80 : 0,
+      yOffset: customCoords ? customCoords.y - defaultTopY - 21 : 0,
       width: null,
       height: null,
       note: '',
@@ -835,6 +850,21 @@ export default function App() {
 
   // Canvas Panning & Mouse Movement Handlers
   const handleMouseDown = (e) => {
+    if (pendingPlacementMode && containerRef.current) {
+      e.stopPropagation();
+      const rect = containerRef.current.getBoundingClientRect();
+      const canvasX = (e.clientX - rect.left - transform.x) / transform.scale;
+      const canvasY = (e.clientY - rect.top - transform.y) / transform.scale;
+
+      if (pendingPlacementMode === 'parentNode') {
+        addStandaloneParentNode({ x: canvasX, y: canvasY });
+      } else if (pendingPlacementMode === 'stickyNote') {
+        addStickyNote({ x: canvasX, y: canvasY });
+      }
+      setPendingPlacementMode(null);
+      return;
+    }
+
     if (e.target.dataset?.canvasBackground === 'true' || e.target === containerRef.current) {
       if (editingNodeId) saveNodeText(editingNodeId);
       setSelectedNodeId(null);
@@ -1031,13 +1061,6 @@ export default function App() {
         ...prev,
         scale: newScale
       }));
-	useEffect(() => {
-  const el = containerRef.current;
-  if (!el) return;
-  const onWheel = (e) => handleWheel(e);
-  el.addEventListener('wheel', onWheel, { passive: false });
-  return () => el.removeEventListener('wheel', onWheel);
-});  
     }
   };
 
@@ -1112,6 +1135,12 @@ export default function App() {
   // Global Keydown Handler for Navigation & Editing
   useEffect(() => {
     const handleKeyDown = (e) => {
+      if (e.key === 'Escape' && pendingPlacementMode) {
+        e.preventDefault();
+        setPendingPlacementMode(null);
+        return;
+      }
+
       // Disable shortcuts when editing text, writing a note, or typing in search bar
       if (
         editingNodeId ||
@@ -1145,237 +1174,274 @@ export default function App() {
           }
         }
       }
+
+      // Undo / Redo shortcuts
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+        e.preventDefault();
+        if (e.shiftKey) redo();
+        else undo();
+        return;
+      }
+
+      // Delete selected sticky note
+      if (selectedStickyId && (e.key === 'Delete' || e.key === 'Backspace')) {
+        e.preventDefault();
+        deleteStickyNote(selectedStickyId);
+        return;
+      }
+
+      if (!selectedNodeId) return;
+
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        addChildNode(selectedNodeId);
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        addSiblingNode(selectedNodeId);
+      } else if (e.key === 'Delete' || e.key === 'Backspace') {
+        e.preventDefault();
+        deleteNode(selectedNodeId);
+      }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedNodeId, selectedStickyId, stickyNotes, editingNodeId, editingNoteNodeId, rootNodes, historyIndex]);
+  }, [selectedNodeId, selectedStickyId, stickyNotes, editingNodeId, editingNoteNodeId, rootNodes, historyIndex, history, pendingPlacementMode]);
 
-  // Reset node custom offsets to restore default auto-layout
-  const resetAutoLayout = () => {
-    const clearOffsets = (node) => ({
-      ...node,
-      xOffset: 0,
-      yOffset: 0,
-      children: node.children ? node.children.map(clearOffsets) : []
-    });
-    updateTree(rootNodes.map(clearOffsets));
-  };
+  // Tree Layout Engine supporting Multiple Independent Parent Roots on Same Sheet
+  const calculateTreeLayout = useCallback(() => {
+    const VERTICAL_GAP = 16;
+    const HORIZONTAL_GAP = 220;
 
-  // Tree coordinate & connection line layout calculation for multiple roots
-  const calculateLayout = useCallback(() => {
-    const nodeCoords = {};
+    // Calculate subtree vertical height for proportional branch distribution
+    const computeSubtreeHeight = (node) => {
+      const nodeH = node.height || (node.isSmall ? 32 : 42);
+      if (!node.expanded || !node.children || node.children.length === 0) {
+        return nodeH + VERTICAL_GAP;
+      }
+      let total = 0;
+      node.children.forEach((child) => {
+        total += computeSubtreeHeight(child);
+      });
+      return Math.max(nodeH + VERTICAL_GAP, total);
+    };
+
+    const coords = {};
     const lines = [];
-    let currentGlobalY = 0;
 
-    rootNodes.forEach((rootNode) => {
-      const layoutSubtree = (node, startY, level = 0) => {
-        const defaultWidth = node.isSmall ? 100 : 160;
-        const defaultHeight = node.isSmall ? 32 : 42;
-        const NODE_WIDTH = node.width || defaultWidth;
-        const NODE_HEIGHT = node.height || defaultHeight;
-        const VERTICAL_GAP = 16;
+    const layoutNode = (node, depth, topY, parentCoords = null) => {
+      const nodeW = node.width || (node.isSmall ? 100 : 160);
+      const nodeH = node.height || (node.isSmall ? 32 : 42);
+      const subtreeH = computeSubtreeHeight(node);
 
-        let totalHeight = 0;
-        const childLayouts = [];
+      // Apply user free-position custom offsets on top of computed layout
+      const baseX = depth * HORIZONTAL_GAP;
+      const baseY = topY + subtreeH / 2 - nodeH / 2;
 
-        if (node.expanded && node.children && node.children.length > 0) {
-          let currentY = startY;
-          node.children.forEach((child) => {
-            const childLayout = layoutSubtree(child, currentY, level + 1);
-            childLayouts.push(childLayout);
-            currentY += childLayout.height + VERTICAL_GAP;
-          });
-          totalHeight = currentY - startY - VERTICAL_GAP;
-        } else {
-          totalHeight = NODE_HEIGHT;
-        }
+      const x = baseX + (node.xOffset || 0);
+      const y = baseY + (node.yOffset || 0);
 
-        const nodeX = level * 220 + (node.xOffset || 0);
-        const nodeY = startY + totalHeight / 2 - NODE_HEIGHT / 2 + (node.yOffset || 0);
+      coords[node.id] = { x, y, width: nodeW, height: nodeH, data: node };
 
-        nodeCoords[node.id] = {
-          x: nodeX,
-          y: nodeY,
-          width: NODE_WIDTH,
-          height: NODE_HEIGHT,
-          data: node
-        };
-
-        if (node.expanded && node.children && node.children.length > 0) {
-          childLayouts.forEach((childLayout) => {
-            const childCoords = nodeCoords[childLayout.id];
-            if (childCoords) {
-              lines.push({
-                id: `${node.id}-${childLayout.id}`,
-                x1: nodeX + NODE_WIDTH,
-                y1: nodeY + NODE_HEIGHT / 2,
-                x2: childCoords.x,
-                y2: childCoords.y + childCoords.height / 2,
-                colorIndex: childLayout.colorIndex,
-                customColor: childLayout.customColor
-              });
-            }
-          });
-        }
-
-        return {
-          id: node.id,
-          height: Math.max(totalHeight, NODE_HEIGHT),
+      if (parentCoords) {
+        lines.push({
+          id: `${parentCoords.data.id}-${node.id}`,
+          x1: parentCoords.x + parentCoords.width,
+          y1: parentCoords.y + parentCoords.height / 2,
+          x2: x,
+          y2: y + nodeH / 2,
           colorIndex: node.colorIndex,
           customColor: node.customColor
-        };
-      };
+        });
+      }
 
-      const rootLayout = layoutSubtree(rootNode, currentGlobalY, 0);
-      currentGlobalY += rootLayout.height + 80;
+      if (node.expanded && node.children && node.children.length > 0) {
+        let currentChildTop = topY;
+        node.children.forEach((child) => {
+          const childSubtreeH = computeSubtreeHeight(child);
+          layoutNode(child, depth + 1, currentChildTop, coords[node.id]);
+          currentChildTop += childSubtreeH;
+        });
+      }
+    };
+
+    let currentRootTop = 0;
+    rootNodes.forEach((root) => {
+      const rootHeight = computeSubtreeHeight(root);
+      layoutNode(root, 0, currentRootTop, null);
+      currentRootTop += rootHeight + 60; // Padding between independent parent trees
     });
 
-    return { nodeCoords, lines };
+    return { coords, lines };
   }, [rootNodes]);
 
-  const { nodeCoords, lines } = calculateLayout();
+  const { coords: nodeCoords, lines } = calculateTreeLayout();
 
+  // Reset all free-drag offsets back to clean automatic tree alignment
+  const resetAutoLayout = () => {
+    const clearOffsets = (nodes) =>
+      nodes.map((node) => ({
+        ...node,
+        xOffset: 0,
+        yOffset: 0,
+        children: node.children ? clearOffsets(node.children) : []
+      }));
+    updateTree(clearOffsets(rootNodes));
+  };
+
+  // Search Filter Check
   const isSearchMatch = (node) => {
     if (!searchQuery.trim()) return false;
     return node.text.toLowerCase().includes(searchQuery.toLowerCase());
   };
 
   return (
-    <div className={`w-full h-screen flex flex-col font-sans select-none overflow-hidden ${darkMode ? 'dark bg-slate-950 text-slate-100' : 'bg-slate-50 text-slate-800'}`}>
-      {/* Header */}
-      <header className="h-14 px-4 bg-slate-900 border-b border-slate-800 flex items-center justify-between z-10">
-        <div className="flex items-center space-x-3">
-          <div className="p-2 rounded-xl bg-indigo-600 text-white shadow-lg shadow-indigo-500/30">
-            <FolderTree className="w-5 h-5" />
+    <div className={`w-screen h-screen flex flex-col overflow-hidden select-none font-sans ${darkMode ? 'dark bg-slate-950 text-slate-100' : 'bg-slate-50 text-slate-900'}`}>
+      {/* Top Navigation & Sheet Tabs Header */}
+      <div className="flex flex-col border-b border-slate-800 bg-slate-900/95 backdrop-blur-md z-30">
+        {/* Main App Bar */}
+        <div className="h-14 px-4 flex items-center justify-between gap-2">
+          <div className="flex items-center space-x-2.5">
+            <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center shadow-lg shadow-indigo-500/20">
+              <Network className="w-4 h-4 text-white" />
+            </div>
+            <div>
+              <h1 className="text-sm font-bold tracking-tight text-white flex items-center gap-1.5">
+                Free Map
+                <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
+                  PRO
+                </span>
+              </h1>
+            </div>
           </div>
-          <h1 className="font-bold text-base tracking-wide bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent hidden sm:block">
-            Free Map
-          </h1>
-        </div>
 
-        {/* Search Bar */}
-        <div className="relative max-w-xs w-full hidden sm:block">
-          <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-          <input
-            type="text"
-            placeholder="Search topics..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full pl-9 pr-4 py-1.5 text-xs rounded-xl bg-slate-800/80 border border-slate-700/60 focus:outline-none focus:border-indigo-500 text-slate-200 placeholder-slate-400 transition"
-          />
-        </div>
+          {/* Center Quick Actions */}
+          <div className="flex items-center space-x-1.5">
+            <button
+              onClick={() =>
+                setPendingPlacementMode((prev) => (prev === 'parentNode' ? null : 'parentNode'))
+              }
+              className={`px-2.5 py-1.5 rounded-xl text-xs font-semibold transition flex items-center gap-1.5 shadow-md ${
+                pendingPlacementMode === 'parentNode'
+                  ? 'bg-emerald-600 hover:bg-emerald-500 text-white ring-2 ring-emerald-300 shadow-emerald-600/30'
+                  : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-indigo-600/20'
+              }`}
+              title="Click on the canvas to place a new Parent Topic Tree"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">
+                {pendingPlacementMode === 'parentNode' ? 'Click Canvas...' : 'Parent Node'}
+              </span>
+            </button>
 
-        {/* Action Controls */}
-        <div className="flex items-center space-x-2">
-          {/* Add Sticky Note Button */}
-          <button
-            onClick={addStickyNote}
-            className="px-3 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 transition flex items-center gap-1.5 text-xs font-bold shadow-md shadow-amber-500/25"
-            title="Create a freely movable & resizable sticky note on this canvas"
-          >
-            <StickyNote className="w-4 h-4" />
-            <span>+ Sticky Note</span>
-          </button>
+            <button
+              onClick={() =>
+                setPendingPlacementMode((prev) => (prev === 'stickyNote' ? null : 'stickyNote'))
+              }
+              className={`px-2.5 py-1.5 rounded-xl border text-xs font-semibold transition flex items-center gap-1.5 ${
+                pendingPlacementMode === 'stickyNote'
+                  ? 'bg-amber-500 text-slate-950 border-amber-300 ring-2 ring-amber-200 shadow-md'
+                  : 'bg-amber-500/20 hover:bg-amber-500/30 border-amber-500/40 text-amber-200'
+              }`}
+              title="Click on the canvas to place a Sticky Note"
+            >
+              <StickyNote className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">
+                {pendingPlacementMode === 'stickyNote' ? 'Click Canvas...' : '+ Sticky Note'}
+              </span>
+            </button>
 
-          {/* Add Independent Parent Node Button */}
-          <button
-            onClick={addStandaloneParentNode}
-            className="px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white transition flex items-center gap-1.5 text-xs font-semibold shadow-md shadow-indigo-600/30"
-            title="Create a new independent parent node on this canvas tab"
-          >
-            <Network className="w-4 h-4" />
-            <span>+ New Parent Node</span>
-          </button>
+            <div className="h-5 w-px bg-slate-800 mx-1" />
 
-          <div className="h-4 w-px bg-slate-700 mx-1" />
-
-          {/* Undo / Redo */}
-          <div className="flex items-center bg-slate-800/60 rounded-lg p-0.5 border border-slate-700/50">
             <button
               onClick={undo}
               disabled={historyIndex <= 0}
+              className="p-1.5 rounded-xl hover:bg-slate-800 text-slate-300 disabled:opacity-30 transition"
               title="Undo (Ctrl+Z)"
-              className="p-1.5 rounded hover:bg-slate-700 disabled:opacity-40 text-slate-300 transition"
             >
               <RotateCcw className="w-4 h-4" />
             </button>
-            <button
-              onClick={redo}
-              disabled={historyIndex >= history.length - 1}
-              title="Redo (Ctrl+Shift+Z)"
-              className="p-1.5 rounded hover:bg-slate-700 disabled:opacity-40 text-slate-300 transition"
-            >
-              <RotateCcw className="w-4 h-4 transform scale-x-[-1]" />
-            </button>
           </div>
 
-          <div className="h-4 w-px bg-slate-700 mx-1" />
+          {/* Right Tools: Search, Import/Export, Theme, Help */}
+          <div className="flex items-center space-x-1.5">
+            <div className="relative hidden md:flex items-center">
+              <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5" />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Search nodes..."
+                className="pl-8 pr-3 py-1.5 rounded-xl bg-slate-950 border border-slate-800 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-indigo-500 w-44 transition"
+              />
+            </div>
 
-          {/* Import / Export JSON */}
-          <button
-            onClick={exportJSON}
-            title="Export JSON Map"
-            className="p-2 rounded-lg hover:bg-slate-800 border border-slate-700/50 text-slate-300 transition"
-          >
-            <Download className="w-4 h-4" />
-          </button>
-          <label
-            title="Import JSON Map"
-            className="p-2 rounded-lg hover:bg-slate-800 border border-slate-700/50 text-slate-300 transition cursor-pointer"
-          >
-            <Upload className="w-4 h-4" />
-            <input type="file" accept=".json" onChange={importJSON} className="hidden" />
-          </label>
-          <button
-            onClick={handleExportMarkdown}
-            title="Export as Markdown Outline"
-            className="p-2 rounded-lg hover:bg-slate-800 border border-slate-700/50 text-slate-300 transition flex items-center gap-1 text-xs font-medium"
-          >
-            <FileText className="w-4 h-4" />
-            <span className="hidden md:inline">Markdown</span>
-          </button>
+            <button
+              onClick={exportJSON}
+              className="p-2 rounded-xl hover:bg-slate-800 text-slate-300 transition"
+              title="Export Map & Sticky Notes (JSON)"
+            >
+              <Download className="w-4 h-4" />
+            </button>
 
-          <div className="h-4 w-px bg-slate-700 mx-1" />
+            <label
+              className="p-2 rounded-xl hover:bg-slate-800 text-slate-300 transition cursor-pointer"
+              title="Import Map (JSON)"
+            >
+              <Upload className="w-4 h-4" />
+              <input type="file" accept=".json" onChange={importJSON} className="hidden" />
+            </label>
 
-          {/* Dark Mode Toggle */}
-          <button
-            onClick={() => setDarkMode(!darkMode)}
-            title="Toggle Theme"
-            className="p-2 rounded-lg hover:bg-slate-800 border border-slate-700/50 text-slate-300 transition"
-          >
-            {darkMode ? <Sun className="w-4 h-4 text-amber-400" /> : <Moon className="w-4 h-4 text-indigo-600" />}
-          </button>
+            <button
+              onClick={handleExportMarkdown}
+              className="p-2 rounded-xl hover:bg-slate-800 text-slate-300 transition"
+              title="Export Markdown Outline"
+            >
+              <FileText className="w-4 h-4" />
+            </button>
 
-          {/* Shortcuts Help */}
-          <button
-            onClick={() => setShowHelpModal(true)}
-            title="Shortcuts & Instructions"
-            className="p-2 rounded-lg hover:bg-slate-800 border border-slate-700/50 text-slate-300 transition"
-          >
-            <HelpCircle className="w-4 h-4" />
-          </button>
+            <button
+              onClick={() => setDarkMode(!darkMode)}
+              className="p-2 rounded-xl hover:bg-slate-800 text-slate-300 transition"
+              title="Toggle Canvas Theme"
+            >
+              {darkMode ? <Sun className="w-4 h-4 text-amber-400" /> : <Moon className="w-4 h-4" />}
+            </button>
+
+            <button
+              onClick={() => setShowHelpModal(true)}
+              className="p-2 rounded-xl hover:bg-slate-800 text-slate-300 transition"
+              title="Keyboard Shortcuts & Help"
+            >
+              <HelpCircle className="w-4 h-4" />
+            </button>
+          </div>
         </div>
-      </header>
 
-      {/* Excel Sheet Style Multi-Tab Navigation Bar */}
-      <div className="h-9 px-3 bg-slate-900 border-b border-slate-800 flex items-center justify-between overflow-x-auto z-10 select-none">
-        <div className="flex items-center space-x-1">
+        {/* Sheet Tabs Bar */}
+        <div className="px-4 py-1.5 flex items-center space-x-1.5 bg-slate-950/70 border-t border-slate-800/80 overflow-x-auto">
           {tabs.map((tab) => {
             const isActive = tab.id === activeTabId;
-            const isEditing = tab.id === editingTabId;
-
             return (
               <div
                 key={tab.id}
-                onClick={() => setActiveTabId(tab.id)}
-                className={`flex items-center space-x-1.5 px-3 py-1 rounded-t-lg text-xs font-medium cursor-pointer transition border-t border-x ${
+                onClick={() => {
+                  setActiveTabId(tab.id);
+                  setSelectedNodeId(tab.rootNodes[0]?.id || null);
+                  setSelectedStickyId(null);
+                }}
+                onDoubleClick={() => {
+                  setEditingTabId(tab.id);
+                  setEditingTabTitle(tab.title);
+                }}
+                className={`px-3 py-1 rounded-lg text-xs font-medium flex items-center space-x-1.5 cursor-pointer transition ${
                   isActive
-                    ? 'bg-slate-950 border-slate-700 text-indigo-400 font-semibold shadow-sm'
-                    : 'bg-slate-900/60 border-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+                    ? 'bg-indigo-600/25 border border-indigo-500/50 text-indigo-200'
+                    : 'hover:bg-slate-800/70 text-slate-400 border border-transparent'
                 }`}
               >
-                {isEditing ? (
+                <FolderTree className="w-3.5 h-3.5" />
+                {editingTabId === tab.id ? (
                   <input
                     type="text"
                     value={editingTabTitle}
@@ -1384,19 +1450,12 @@ export default function App() {
                     onBlur={() => saveTabTitle(tab.id)}
                     onKeyDown={(e) => {
                       if (e.key === 'Enter') saveTabTitle(tab.id);
+                      if (e.key === 'Escape') setEditingTabId(null);
                     }}
-                    className="bg-transparent border-b border-indigo-400 text-indigo-300 outline-none w-24 text-xs font-semibold"
+                    className="bg-slate-900 text-white px-1 rounded outline-none w-28"
                   />
                 ) : (
-                  <span
-                    onDoubleClick={() => {
-                      setEditingTabId(tab.id);
-                      setEditingTabTitle(tab.title);
-                    }}
-                    title="Double click to rename tab"
-                  >
-                    {tab.title}
-                  </span>
+                  <span>{tab.title}</span>
                 )}
 
                 {tabs.length > 1 && (
@@ -1429,7 +1488,10 @@ export default function App() {
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
-        className={`flex-1 relative overflow-hidden cursor-grab active:cursor-grabbing ${
+        onWheel={handleWheel}
+        className={`flex-1 relative overflow-hidden ${
+          pendingPlacementMode ? 'cursor-crosshair' : 'cursor-grab active:cursor-grabbing'
+        } ${
           darkMode ? 'bg-slate-950' : 'bg-slate-50'
         }`}
         style={{
@@ -1439,19 +1501,35 @@ export default function App() {
           backgroundSize: '24px 24px'
         }}
       >
-        {/* Node Toolbar Popover (When a Node is Selected and Overlay Enabled & Not Currently Dragging) */}
-        {showNodeOverlay && selectedNodeId && nodeCoords[selectedNodeId] && !draggingNodeId && (
+        {/* Interactive Click-to-Place Prompt Banner */}
+        {pendingPlacementMode && (
           <div
-            className="absolute z-30 flex flex-col gap-1.5 p-2 rounded-2xl border shadow-2xl bg-slate-900/95 border-slate-700/80 text-white backdrop-blur-md transition-all -translate-x-1/2 -translate-y-[calc(100%+14px)] pointer-events-auto"
-            style={{
-              left: `${nodeCoords[selectedNodeId].x * transform.scale + transform.x + (nodeCoords[selectedNodeId].width / 2) * transform.scale}px`,
-              top: `${nodeCoords[selectedNodeId].y * transform.scale + transform.y}px`
-            }}
+            onMouseDown={(e) => e.stopPropagation()}
+            className="fixed top-28 left-1/2 -translate-x-1/2 z-40 px-4 py-2 rounded-full bg-indigo-600/95 border border-indigo-400 text-white text-xs font-semibold shadow-2xl backdrop-blur-md flex items-center gap-3 animate-fade-in"
+          >
+            <span>
+              Click anywhere on the canvas to place your{' '}
+              {pendingPlacementMode === 'parentNode' ? 'new Parent Node' : 'Sticky Note'}
+            </span>
+            <button
+              onClick={() => setPendingPlacementMode(null)}
+              className="px-2 py-0.5 rounded-full bg-slate-900/50 hover:bg-slate-900 text-indigo-100 text-[11px] transition flex items-center gap-1"
+              title="Cancel placement (Esc)"
+            >
+              <X className="w-3 h-3" /> Cancel
+            </button>
+          </div>
+        )}
+
+        {/* Node Toolbar Popover (Locked at the Bottom Section of the Canvas when a Node is Selected) */}
+        {showNodeOverlay && selectedNodeId && nodeCoords[selectedNodeId] && (
+          <div
+            className="fixed bottom-20 left-1/2 -translate-x-1/2 z-30 flex flex-col gap-1.5 p-2.5 rounded-2xl border shadow-2xl bg-slate-900/95 border-slate-700/80 text-white backdrop-blur-md transition-all pointer-events-auto max-w-[95vw]"
             onMouseDown={(e) => e.stopPropagation()}
             onClick={(e) => e.stopPropagation()}
           >
             {/* Top Row: Primary Actions */}
-            <div className="flex items-center space-x-1">
+            <div className="flex flex-wrap items-center justify-center gap-1">
               <button
                 onClick={() => addChildNode(selectedNodeId, false)}
                 className="px-2.5 py-1.5 rounded-xl hover:bg-indigo-600 bg-indigo-600/20 border border-indigo-500/40 text-indigo-200 hover:text-white transition flex items-center text-xs font-semibold gap-1"
@@ -1493,15 +1571,15 @@ export default function App() {
             </div>
 
             {/* Bottom Row: Formatting, Styling & Controls */}
-            <div className="flex items-center space-x-1 justify-between pt-1 border-t border-slate-800">
+            <div className="flex flex-wrap items-center gap-1 justify-between pt-1 border-t border-slate-800">
               <button
                 onClick={() => toggleLockNode(selectedNodeId)}
                 className={`p-1.5 rounded-xl border transition ${
                   findNode(rootNodes, selectedNodeId)?.isLocked
-                    ? 'bg-rose-600/30 border-rose-500/60 text-rose-300 hover:bg-rose-600/50'
-                    : 'bg-slate-800 border-slate-700/60 text-slate-300 hover:bg-slate-700'
+                    ? 'bg-rose-600/25 border-rose-500/60 text-rose-300'
+                    : 'hover:bg-slate-800 border-slate-700/50 text-slate-200'
                 }`}
-                title={findNode(rootNodes, selectedNodeId)?.isLocked ? "Unlock Position (L)" : "Lock Position (L)"}
+                title="Lock / Unlock Node Position (L)"
               >
                 {findNode(rootNodes, selectedNodeId)?.isLocked ? <Lock className="w-4 h-4" /> : <Unlock className="w-4 h-4" />}
               </button>
@@ -1545,7 +1623,7 @@ export default function App() {
                     <Palette className="w-4 h-4" />
                   </button>
                   {showColorPicker && (
-                    <div className="absolute top-10 left-0 p-2.5 rounded-2xl bg-slate-900 border border-slate-700 shadow-2xl flex flex-col gap-2 z-50 w-52">
+                    <div className="absolute bottom-11 left-0 p-2.5 rounded-2xl bg-slate-900 border border-slate-700 shadow-2xl flex flex-col gap-2 z-50 w-52">
                       <span className="text-[10px] font-semibold tracking-wider text-slate-400 uppercase">Preset Themes</span>
                       <div className="grid grid-cols-4 gap-1.5 max-h-36 overflow-y-auto p-0.5">
                         {COLOR_PALETTE.map((col, idx) => (
@@ -1587,7 +1665,7 @@ export default function App() {
                     <Smile className="w-4 h-4" />
                   </button>
                   {showEmojiPicker && (
-                    <div className="absolute top-10 right-0 p-2 rounded-2xl bg-slate-900 border border-slate-700 shadow-2xl grid grid-cols-4 gap-1 z-50 w-44">
+                    <div className="absolute bottom-11 right-0 p-2 rounded-2xl bg-slate-900 border border-slate-700 shadow-2xl grid grid-cols-4 gap-1 z-50 w-44">
                       <button
                         onClick={() => setNodeEmoji(selectedNodeId, '')}
                         className="col-span-4 py-1 text-[10px] text-slate-400 hover:bg-slate-800 rounded mb-1"
@@ -1636,7 +1714,7 @@ export default function App() {
             </div>
 
             {/* Third Row: Precise Measurement Inputs */}
-            <div className="flex flex-wrap items-center gap-1.5 pt-1 border-t border-slate-800 text-[10px] text-slate-400">
+            <div className="flex flex-wrap items-center justify-center gap-1.5 pt-1 border-t border-slate-800 text-[10px] text-slate-400">
               <div className="flex items-center space-x-1 bg-slate-950 px-1.5 py-0.5 rounded-lg border border-slate-800">
                 <span className="font-semibold text-slate-500">X:</span>
                 <input
@@ -2398,7 +2476,7 @@ export default function App() {
         </div>
 
         {/* Floating Zoom & Controls Bar */}
-        <div className="absolute bottom-6 right-6 flex items-center space-x-2 z-20">
+        <div className="fixed bottom-6 right-6 flex items-center space-x-2 z-20 pointer-events-auto">
           <button
             onClick={() => setShowNodeOverlay(!showNodeOverlay)}
             className={`px-3 py-2 rounded-xl border shadow-lg backdrop-blur-md transition flex items-center gap-1.5 text-xs font-medium ${
@@ -2448,7 +2526,7 @@ export default function App() {
         </div>
 
         {/* Quick Help Floating Tip Banner */}
-        <div className="absolute bottom-6 left-6 hidden md:flex items-center space-x-3 px-4 py-2 rounded-xl border shadow-lg backdrop-blur-md bg-slate-900/80 border-slate-800 text-xs text-slate-400">
+        <div className="fixed bottom-6 left-6 hidden md:flex items-center space-x-3 px-4 py-2 rounded-xl border shadow-lg backdrop-blur-md bg-slate-900/80 border-slate-800 text-xs text-slate-400 z-20 pointer-events-auto">
           <span className="flex items-center gap-1 font-medium text-slate-300">
             <kbd className="px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono text-[11px]">Drag Node</kbd>
             Move Freely
