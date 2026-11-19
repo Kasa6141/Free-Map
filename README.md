@@ -1,4 +1,18 @@
 # Free-Map
+<div align="center">
+<details>
+
+  <summary>Introduction</summary>
+
+I have no clue what to write here, but I'll be back with proper intro here soon xD
+
+```ruby
+   puts "Hello World - Yes, I copy pasted this from the guide cause
+   I have no time to ai this shit and ai is a worse writer than I am.. I think?"
+```
+
+</details>
+
 I've always wondered why no one is able to create a free and working Mind Map with robust functionality without all the hassle of ads and/or trackers - So, like any typical person would do at this current age, I created this straight-forward application and provide some extra functionality to my app which then allow me to jot down what I need in a rather easy way with some additional info attach to them, so I can view them easily. The application work locally on any-working pc as is, and everything can be stored locally on your device!
 
 (Note: I should be able to sync the saved project onto any of your choosing cloud based storage like gdrive for example, but the integration I have on right now is not working properly and I sincerely have no clue how to fix it at the moment xD).
@@ -6,6 +20,7 @@ I've always wondered why no one is able to create a free and working Mind Map wi
 This would definitely works great for high school student or college student for any kind of work really - It works for me as it helps me keep certain data I need in a neat & quick fashion.
 
 Some of the functionality that I add into the application should improve most of any office worker or anyone really, who need some other way to input their thinking or any info into words or images, or even videos! (Soon to be added, the size of each videos can take a lot of space and not soo convenient in the long run).
+
 
 <img width="1919" height="1031" alt="image" src="https://github.com/user-attachments/assets/38fbb8ab-920b-43cc-b263-df2be8f77007" />
 
