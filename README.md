@@ -7,8 +7,31 @@
 I have no clue what to write here, but I'll be back with proper intro here soon xD
 
 ```ruby
-   puts "Hello World - Yes, I copy pasted this from the guide cause
-   I have no time to ai this shit and ai is a worse writer than I am.. I think?"
+   Feature
+
+The main page;
+
+Add nodes (Parent nodes - Child nodes - Sibling nodes)
+
+Resize and reposition them however you want
+
+You can also write inside of them, crazy I know~
+
+You can upload your own document in here, like pdf and docx (cause why wouldn't you?) docx support will be added soon now that I mentioned it xD
+
+Zooming in and out like you're high
+
+There are some icon you can play around with if you want (adding in your own icon will be included if I can get my hands on how to copy and paste the same code from uploading the pdf)
+
+Color - cause I like color
+
+I might be wrong but you can actually upload picture here in the sketchy yellow note
+
+I wanted to say that, I lo- you can also toggle the overlay on and off like how your ex does to you when she was bored xD
+
+I don't what else but-
+
+More stuff to be added soon!
 ```
 
 </details>
