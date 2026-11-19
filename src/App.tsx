@@ -19,6 +19,7 @@ import {
   Move,
   FileText,
   RotateCcw,
+  RotateCw,
   Sparkles,
   Layout,
   Share2,
@@ -812,13 +813,11 @@ export default function App() {
   };
 
   const findParentNode = (nodes, id) => {
-    for (let node of nodes) {
+    for (const node of nodes) {
       if (!node.children) continue;
-      for (let child of node.children) {
-        if (child.id === id) return node;
-        const found = findParentNode(node.children, id);
-        if (found) return found;
-      }
+      if (node.children.some((child) => child.id === id)) return node;
+      const found = findParentNode(node.children, id);
+      if (found) return found;
     }
     return null;
   };
@@ -1016,11 +1015,9 @@ export default function App() {
   };
 
   const addSiblingNode = (targetId, isSmall = false) => {
+    // Siblings only exist between Child nodes, so do nothing on a Parent (root)
     const isTargetRoot = rootNodes.some((r) => r.id === targetId);
-    if (isTargetRoot) {
-      addStandaloneParentNode();
-      return;
-    }
+    if (isTargetRoot) return;
     const parentNode = findParentNode(rootNodes, targetId);
     if (!parentNode) return;
 
@@ -1181,47 +1178,43 @@ export default function App() {
       const rawDx = (e.clientX - dragStartPos.x) / transform.scale;
       const rawDy = (e.clientY - dragStartPos.y) / transform.scale;
 
-      let newXOffset = initialNodeOffset.x + rawDx;
-      let newYOffset = initialNodeOffset.y + rawDy;
+      const newXOffset = initialNodeOffset.x + rawDx;
+      const newYOffset = initialNodeOffset.y + rawDy;
 
-      // Smart Snap-to-Center Alignment Logic
+      // Soft alignment guides: a visual hint only, the node position is never changed
       const activeCoords = nodeCoords[draggingNodeId];
       if (activeCoords) {
-        const SNAP_THRESHOLD = 12; // Snap sensitivity in canvas px
-        const currentWidth = activeCoords.width;
-        const currentHeight = activeCoords.height;
+        const GUIDE_THRESHOLD = 8; // canvas px: how close before a guide line appears
 
         // Base auto-layout position without custom offsets
         const baseCanvasX = activeCoords.x - (activeCoords.data.xOffset || 0);
         const baseCanvasY = activeCoords.y - (activeCoords.data.yOffset || 0);
 
-        const activeCenterX = baseCanvasX + newXOffset + currentWidth / 2;
-        const activeCenterY = baseCanvasY + newYOffset + currentHeight / 2;
+        const activeCenterX = baseCanvasX + newXOffset + activeCoords.width / 2;
+        const activeCenterY = baseCanvasY + newYOffset + activeCoords.height / 2;
 
-        let snapX = null;
-        let snapY = null;
+        let guideX = null;
+        let guideY = null;
+        let bestDX = GUIDE_THRESHOLD;
+        let bestDY = GUIDE_THRESHOLD;
 
-        // Check center alignment against all other visible nodes on canvas
+        // Show a guide for the closest aligned node on each axis
         Object.keys(nodeCoords).forEach((otherId) => {
           if (otherId === draggingNodeId) return;
           const other = nodeCoords[otherId];
           const otherCenterX = other.x + other.width / 2;
           const otherCenterY = other.y + other.height / 2;
 
-          // Vertical alignment (Center-to-Center align when placed above or below)
-          if (Math.abs(activeCenterX - otherCenterX) < SNAP_THRESHOLD) {
-            newXOffset = otherCenterX - baseCanvasX - currentWidth / 2;
-            snapX = otherCenterX;
-          }
-
-          // Horizontal alignment (Center-to-Center align when placed left or right)
-          if (Math.abs(activeCenterY - otherCenterY) < SNAP_THRESHOLD) {
-            newYOffset = otherCenterY - baseCanvasY - currentHeight / 2;
-            snapY = otherCenterY;
-          }
+          const dx = Math.abs(activeCenterX - otherCenterX);
+          const dy = Math.abs(activeCenterY - otherCenterY);
+          if (dx < bestDX) { bestDX = dx; guideX = otherCenterX; }
+          if (dy < bestDY) { bestDY = dy; guideY = otherCenterY; }
         });
 
-        setAlignmentGuides({ x: snapX, y: snapY });
+        // Only update state when the guides actually change (avoids extra re-renders)
+        setAlignmentGuides((prev) =>
+          prev.x === guideX && prev.y === guideY ? prev : { x: guideX, y: guideY }
+        );
       }
 
       const newTree = modifyNode(rootNodes, draggingNodeId, (node) => ({
@@ -1459,9 +1452,10 @@ export default function App() {
       }
 
       // Undo / Redo shortcuts
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+	  const zKey = e.key.toLowerCase();
+      if ((e.ctrlKey || e.metaKey) && (zKey === 'z' || zKey === 'y')) {
         e.preventDefault();
-        if (e.shiftKey) redo();
+        if (zKey === 'y' || e.shiftKey) redo();
         else undo();
         return;
       }
@@ -1656,6 +1650,15 @@ export default function App() {
             >
               <RotateCcw className="w-4 h-4" />
             </button>
+			
+			<button
+			  onClick={redo}
+              disabled={historyIndex >= history.length - 1}
+              className="p-1.5 rounded-xl hover:bg-slate-800 text-slate-300 disabled:opacity-30 transition"
+              title="Redo (Ctrl+Shift+Z / Ctrl+Y)"
+            >
+              <RotateCw className="w-4 h-4" />
+            </button>
           </div>
 
           {/* Right Tools: Search, Import/Export, Theme, Help */}
@@ -1840,8 +1843,9 @@ export default function App() {
               </button>
               <button
                 onClick={() => addSiblingNode(selectedNodeId, false)}
-                className="px-2 py-1.5 rounded-xl hover:bg-slate-800 bg-slate-800/60 border border-slate-700/60 text-slate-200 hover:text-white transition flex items-center text-xs font-semibold gap-1"
-                title="Add Sibling Node (Enter)"
+                disabled={rootNodes.some((r) => r.id === selectedNodeId)}
+                className="px-2 py-1.5 rounded-xl hover:bg-slate-800 bg-slate-800/60 border border-slate-700/60 text-slate-200 hover:text-white transition flex items-center text-xs font-semibold gap-1 disabled:opacity-30 disabled:cursor-not-allowed"
+                title="Add Sibling Node (Enter) - Child nodes only"
               >
                 <ArrowRight className="w-3.5 h-3.5" /> Sibling
               </button>
