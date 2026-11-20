@@ -86,9 +86,102 @@ const getContrastTextColor = (hex) => {
   return yiq >= 135 ? '#0f172a' : '#f8fafc';
 };
 
+// ---------- Helpers ----------
+// Collision-proof ids (Date.now() can repeat within the same millisecond)
+const genId = (prefix: string) =>
+  `${prefix}-${
+    typeof crypto !== 'undefined' && (crypto as any).randomUUID
+      ? (crypto as any).randomUUID()
+      : Date.now().toString(36) + Math.random().toString(36).slice(2, 10)
+  }`;
+
+// Undo history is capped so memory doesn't grow forever
+const MAX_HISTORY = 100;
+
+// Images larger than this (in px, longest side) are downscaled when attached
+const MAX_IMAGE_DIM = 1600;
+
+// Reads an image file as a data URL, shrinking oversized PNG/JPEG/WebP files.
+// GIF/SVG are left untouched so animation / vector data isn't lost.
+const readImageFile = (file: File): Promise<string> =>
+  new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error);
+    reader.onload = () => {
+      const dataUrl = reader.result as string;
+      if (!/^image\/(png|jpe?g|webp)$/i.test(file.type)) {
+        resolve(dataUrl);
+        return;
+      }
+      const img = new Image();
+      img.onerror = () => resolve(dataUrl);
+      img.onload = () => {
+        const scale = Math.min(1, MAX_IMAGE_DIM / Math.max(img.width, img.height));
+        if (scale >= 1) {
+          resolve(dataUrl);
+          return;
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.max(1, Math.round(img.width * scale));
+        canvas.height = Math.max(1, Math.round(img.height * scale));
+        const g = canvas.getContext('2d');
+        if (!g) {
+          resolve(dataUrl);
+          return;
+        }
+        g.drawImage(img, 0, 0, canvas.width, canvas.height);
+        const outType = /jpe?g/i.test(file.type) ? 'image/jpeg' : file.type;
+        resolve(canvas.toDataURL(outType, 0.85));
+      };
+      img.src = dataUrl;
+    };
+    reader.readAsDataURL(file);
+  });
+
+// Makes imported JSON safe to render: guarantees id / text / children and unique ids
+const normalizeNode = (raw: any, seen: Set<string>): any => {
+  const n = raw && typeof raw === 'object' ? raw : {};
+  let id = typeof n.id === 'string' && n.id ? n.id : genId('node');
+  if (seen.has(id)) id = genId('node');
+  seen.add(id);
+  return {
+    ...n,
+    id,
+    text: typeof n.text === 'string' ? n.text : n.text == null ? '' : String(n.text),
+    expanded: n.expanded !== false,
+    children: Array.isArray(n.children) ? n.children.map((c: any) => normalizeNode(c, seen)) : []
+  };
+};
+
+const normalizeSticky = (raw: any, seen: Set<string>): any => {
+  const s = raw && typeof raw === 'object' ? raw : {};
+  let id = typeof s.id === 'string' && s.id ? s.id : genId('sticky');
+  if (seen.has(id)) id = genId('sticky');
+  seen.add(id);
+  const num = (v: any, d: number) => (typeof v === 'number' && isFinite(v) ? v : d);
+  return {
+    fontSize: 13,
+    fontFamily: 'sans',
+    isExpanded: false,
+    prevBounds: null,
+    color: '#fef08a',
+    borderColor: '#eab308',
+    isPinned: false,
+    ...s,
+    id,
+    text: typeof s.text === 'string' ? s.text : '',
+    x: num(s.x, 120),
+    y: num(s.y, 120),
+    width: num(s.width, 210),
+    height: num(s.height, 170),
+    images: Array.isArray(s.images) ? s.images : [],
+    pdfs: Array.isArray(s.pdfs) ? s.pdfs : []
+  };
+};
+
 // Default Tree Builder Helper
 const createDefaultTreeData = (title = 'Central Idea') => ({
-  id: `root-${Date.now()}`,
+  id: genId('root'),
   text: title,
   emoji: '💡',
   colorIndex: 1,
@@ -101,7 +194,7 @@ const createDefaultTreeData = (title = 'Central Idea') => ({
   isSmall: false,
   children: [
     {
-      id: `node-${Date.now()}-1`,
+      id: genId('node'),
       text: 'Main Branch 1',
       emoji: '🎯',
       colorIndex: 2,
@@ -113,7 +206,7 @@ const createDefaultTreeData = (title = 'Central Idea') => ({
       children: []
     },
     {
-      id: `node-${Date.now()}-2`,
+      id: genId('node'),
       text: 'Main Branch 2',
       emoji: '🚀',
       colorIndex: 3,
@@ -212,7 +305,7 @@ const initialTreeData = [
 // Single mind-map node. Memoized so that panning, typing in another node, or
 // selecting something else doesn't re-render every node on the canvas.
 // Handlers read the latest App state/functions through `ctx` (a ref) at click time.
-const MapNodeBase = ({ coords, isSelected, isEditing, isDragOver, isMatch, editingText, draggedNodeId, ctx, nodeRefs }: any) => {
+const MapNodeBase = ({ coords, isSelected, isEditing, isDragOver, isMatch, editingText, draggedNodeId, ctx }: any) => {
   const node = coords.data;
   const palette = COLOR_PALETTE[node.colorIndex] || COLOR_PALETTE[1];
   const { x, y, width, height } = coords;
@@ -234,7 +327,6 @@ const MapNodeBase = ({ coords, isSelected, isEditing, isDragOver, isMatch, editi
   return (
       <div
         key={node.id}
-        ref={(el) => (nodeRefs.current[node.id] = el)}
         style={{
           left: `${x}px`,
           top: `${y}px`,
@@ -465,6 +557,433 @@ const areNodePropsEqual = (a: any, b: any) =>
 
 const MapNode = React.memo(MapNodeBase, areNodePropsEqual);
 
+// Connection lines. Memoized: only re-renders when the layout's `lines` array changes.
+const ConnectionLines = React.memo(({ lines }: any) => (
+  <>
+    {lines.map((line) => {
+      const strokeColor = line.customColor
+        ? line.customColor
+        : (COLOR_PALETTE[line.colorIndex] || COLOR_PALETTE[1]).accent;
+      const deltaX = Math.abs(line.x2 - line.x1) * 0.5;
+      const pathData = `M ${line.x1} ${line.y1} C ${line.x1 + deltaX} ${line.y1}, ${line.x2 - deltaX} ${line.y2}, ${line.x2} ${line.y2}`;
+      return (
+        <path
+          key={line.id}
+          d={pathData}
+          fill="none"
+          stroke={strokeColor}
+          strokeWidth="3"
+          strokeLinecap="round"
+          className="transition-opacity duration-300 opacity-80 hover:opacity-100"
+        />
+      );
+    })}
+  </>
+));
+
+// Single sticky note. Memoized like MapNode; handlers read the latest App functions via `ctx`.
+const StickyNoteBase = ({ sticky, isSelected, isColorOpen, expandedStickyAttachment, ctx }: any) => {
+  const textColor = getContrastTextColor(sticky.color);
+    const isDarkBg = textColor === '#f8fafc';
+
+  return (
+      <div
+        key={sticky.id}
+        style={{
+          left: `${sticky.x}px`,
+          top: `${sticky.y}px`,
+          width: `${sticky.width}px`,
+          height: `${sticky.height}px`,
+          backgroundColor: sticky.color,
+          borderColor: sticky.borderColor || 'rgba(0,0,0,0.18)',
+          color: textColor
+        }}
+        onClick={(e) => {
+          e.stopPropagation();
+          ctx.current.setSelectedStickyId(sticky.id);
+          ctx.current.setSelectedNodeId(null);
+        }}
+        onDoubleClick={(e) => {
+          e.stopPropagation();
+          ctx.current.toggleStickyZoomEnlarge(sticky);
+        }}
+        className={`absolute pointer-events-auto rounded-xl border-2 shadow-2xl flex flex-col transition-[background-color,border-color,box-shadow,transform,scale,opacity] duration-200 ${
+          isSelected ? 'ring-4 ring-indigo-500/80 z-30' : 'z-20'
+        }`}
+      >
+        {/* Sticky Note Top Drag & Control Bar */}
+        <div
+          onMouseDown={(e) => {
+            e.stopPropagation();
+            ctx.current.setSelectedStickyId(sticky.id);
+            ctx.current.setSelectedNodeId(null);
+            if (!sticky.isPinned) {
+              ctx.current.setDraggingStickyId(sticky.id);
+              ctx.current.setStickyDragStart({
+                mouseX: e.clientX,
+                mouseY: e.clientY,
+                noteX: sticky.x,
+                noteY: sticky.y
+              });
+            }
+          }}
+          className={`h-8 px-2 flex items-center justify-between border-b select-none rounded-t-[10px] ${
+            sticky.isPinned ? 'cursor-default' : 'cursor-grab active:cursor-grabbing'
+          }`}
+          style={{
+            borderColor: isDarkBg ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.1)',
+            backgroundColor: isDarkBg ? 'rgba(0,0,0,0.2)' : 'rgba(0,0,0,0.05)'
+          }}
+        >
+          {/* Pin / Lock Position Toggle & Font Controls */}
+          <div className="flex items-center space-x-1">
+            <button
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation();
+                ctx.current.updateStickyNote(sticky.id, { isPinned: !sticky.isPinned });
+              }}
+              className={`p-1 rounded-md transition ${
+                sticky.isPinned
+                  ? 'bg-rose-600 text-white shadow-sm'
+                  : isDarkBg
+                  ? 'hover:bg-white/10 text-slate-200'
+                  : 'hover:bg-black/10 text-slate-700'
+              }`}
+              title={sticky.isPinned ? 'Unpin Sticky Note (L)' : 'Pin / Lock Sticky Note Position (L)'}
+            >
+              <Pin className="w-3.5 h-3.5" />
+            </button>
+
+            {/* Font Family Selector */}
+            <select
+              value={sticky.fontFamily || 'sans'}
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={(e) => e.stopPropagation()}
+              onChange={(e) => ctx.current.updateStickyNote(sticky.id, { fontFamily: e.target.value })}
+              className={`text-[10px] font-semibold rounded px-1 py-0.5 outline-none cursor-pointer border ${
+                isDarkBg
+                  ? 'bg-slate-800 border-slate-700 text-slate-200'
+                  : 'bg-white/70 border-black/15 text-slate-800'
+              }`}
+              title="Font Family"
+            >
+              <option value="sans" className="text-slate-900 bg-white">Sans</option>
+              <option value="serif" className="text-slate-900 bg-white">Serif</option>
+              <option value="mono" className="text-slate-900 bg-white">Mono</option>
+            </select>
+
+            {/* Font Size Decrease / Increase */}
+            <div className="flex items-center">
+              <button
+                onMouseDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  const nextSize = Math.max(10, (sticky.fontSize || 13) - 2);
+                  ctx.current.updateStickyNote(sticky.id, { fontSize: nextSize });
+                }}
+                className={`px-1 py-0.5 rounded text-[10px] font-bold transition ${
+                  isDarkBg ? 'hover:bg-white/10 text-slate-200' : 'hover:bg-black/10 text-slate-800'
+                }`}
+                title="Decrease Font Size"
+              >
+                A-
+              </button>
+              <button
+                onMouseDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  const nextSize = Math.min(36, (sticky.fontSize || 13) + 2);
+                  ctx.current.updateStickyNote(sticky.id, { fontSize: nextSize });
+                }}
+                className={`px-1 py-0.5 rounded text-[10px] font-bold transition ${
+                  isDarkBg ? 'hover:bg-white/10 text-slate-200' : 'hover:bg-black/10 text-slate-800'
+                }`}
+                title="Increase Font Size"
+              >
+                A+
+              </button>
+            </div>
+          </div>
+
+          {/* Right Actions: Color Palette, Enlarge/Zoom & Delete */}
+          <div className="flex items-center space-x-0.5 relative">
+            {/* Upload Images (Max 10) */}
+            <label
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={(e) => e.stopPropagation()}
+              className={`p-1 rounded-md transition cursor-pointer ${
+                (sticky.images?.length || 0) >= 10
+                  ? 'opacity-40 cursor-not-allowed'
+                  : isDarkBg
+                  ? 'hover:bg-white/10 text-slate-200'
+                  : 'hover:bg-black/10 text-slate-700'
+              }`}
+              title={`Upload Images (${sticky.images?.length || 0}/10)`}
+            >
+              <ImageIcon className="w-3.5 h-3.5" />
+              <input
+                type="file"
+                accept="image/*"
+                multiple
+                disabled={(sticky.images?.length || 0) >= 10}
+                onChange={(e) => ctx.current.handleStickyImageUpload(sticky.id, e)}
+                className="hidden"
+              />
+            </label>
+
+            {/* Upload PDFs (Max 10) */}
+            <label
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={(e) => e.stopPropagation()}
+              className={`p-1 rounded-md transition cursor-pointer ${
+                (sticky.pdfs?.length || 0) >= 10
+                  ? 'opacity-40 cursor-not-allowed'
+                  : isDarkBg
+                  ? 'hover:bg-white/10 text-slate-200'
+                  : 'hover:bg-black/10 text-slate-700'
+              }`}
+              title={`Upload PDFs (${sticky.pdfs?.length || 0}/10)`}
+            >
+              <File className="w-3.5 h-3.5" />
+              <input
+                type="file"
+                accept="application/pdf,.pdf"
+                multiple
+                disabled={(sticky.pdfs?.length || 0) >= 10}
+                onChange={(e) => ctx.current.handleStickyPdfUpload(sticky.id, e)}
+                className="hidden"
+              />
+            </label>
+
+            <button
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation();
+                ctx.current.setOpenStickyColorId(isColorOpen ? null : sticky.id);
+              }}
+              className={`p-1 rounded-md transition ${
+                isDarkBg ? 'hover:bg-white/10 text-slate-200' : 'hover:bg-black/10 text-slate-700'
+              }`}
+              title="Change Sticky Note Color"
+            >
+              <Palette className="w-3.5 h-3.5" />
+            </button>
+
+            <button
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation();
+                ctx.current.toggleStickyZoomEnlarge(sticky);
+              }}
+              className={`p-1 rounded-md transition ${
+                sticky.isExpanded
+                  ? 'bg-indigo-600 text-white'
+                  : isDarkBg
+                  ? 'hover:bg-white/10 text-slate-200'
+                  : 'hover:bg-black/10 text-slate-700'
+              }`}
+              title={sticky.isExpanded ? 'Restore Sticky Note Size & Zoom' : 'Enlarge & Zoom to Sticky Note (or Double-Click)'}
+            >
+              <Maximize2 className="w-3.5 h-3.5" />
+            </button>
+
+            <button
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation();
+                ctx.current.deleteStickyNote(sticky.id);
+              }}
+              className={`p-1 rounded-md transition ${
+                isDarkBg ? 'hover:bg-rose-500/30 text-rose-300' : 'hover:bg-rose-500/20 text-rose-700'
+              }`}
+              title="Delete Sticky Note"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+
+            {/* Sticky Note Color Preset & Custom Color Popover */}
+            {isColorOpen && (
+              <div
+                onMouseDown={(e) => e.stopPropagation()}
+                onClick={(e) => e.stopPropagation()}
+                className="absolute top-7 right-0 p-2.5 rounded-xl bg-slate-900 border border-slate-700 shadow-2xl z-50 w-44 text-slate-100 flex flex-col gap-2"
+              >
+                <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+                  Color Presets
+                </span>
+                <div className="grid grid-cols-4 gap-1.5">
+                  {STICKY_NOTE_PRESETS.map((preset, idx) => (
+                    <button
+                      key={idx}
+                      onClick={() => {
+                        ctx.current.updateStickyNote(sticky.id, {
+                          color: preset.bg,
+                          borderColor: preset.border
+                        });
+                        ctx.current.setOpenStickyColorId(null);
+                      }}
+                      className="w-7 h-7 rounded-lg border border-white/25 hover:scale-110 transition shadow-sm"
+                      style={{ backgroundColor: preset.bg }}
+                      title={preset.label}
+                    />
+                  ))}
+                </div>
+
+                <div className="pt-1.5 border-t border-slate-800 flex items-center justify-between">
+                  <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+                    Any Color
+                  </span>
+                  <input
+                    type="color"
+                    value={sticky.color}
+                    onChange={(e) =>
+                      ctx.current.updateStickyNote(sticky.id, {
+                        color: e.target.value,
+                        borderColor: e.target.value
+                      })
+                    }
+                    className="w-7 h-7 rounded cursor-pointer bg-transparent border-0 p-0"
+                    title="Pick Any Custom Color"
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Sticky Note Editable Body */}
+        <textarea
+          value={sticky.text}
+          onMouseDown={(e) => e.stopPropagation()}
+          onDoubleClick={(e) => {
+            e.stopPropagation();
+            ctx.current.toggleStickyZoomEnlarge(sticky);
+          }}
+          onFocus={() => {
+            ctx.current.setSelectedStickyId(sticky.id);
+            ctx.current.setSelectedNodeId(null);
+          }}
+          onChange={(e) => ctx.current.updateStickyNote(sticky.id, { text: e.target.value })}
+          placeholder="Write sticky note..."
+          className={`flex-1 w-full p-2.5 bg-transparent resize-none outline-none font-medium leading-relaxed ${
+            sticky.fontFamily === 'serif'
+              ? 'font-serif'
+              : sticky.fontFamily === 'mono'
+              ? 'font-mono'
+              : 'font-sans'
+          }`}
+          style={{
+            color: textColor,
+            fontSize: `${sticky.fontSize || 13}px`
+          }}
+        />
+
+        {/* Shrunk Attachment Icons Strip (Images & PDFs) */}
+        {((sticky.images && sticky.images.length > 0) || (sticky.pdfs && sticky.pdfs.length > 0)) && (
+          <div
+            onMouseDown={(e) => e.stopPropagation()}
+            onDoubleClick={(e) => e.stopPropagation()}
+            className="px-2 pb-2 pt-1 flex flex-wrap gap-1.5 border-t"
+            style={{
+              borderColor: isDarkBg ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.1)'
+            }}
+          >
+            {/* Small Image Thumbnail Icons */}
+            {(sticky.images || []).map((imgSrc, idx) => (
+              <div
+                key={`img-${idx}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  ctx.current.setExpandedStickyAttachment({ stickyId: sticky.id, type: 'image', index: idx });
+                }}
+                className="relative group w-7 h-7 rounded-md overflow-hidden border border-black/25 cursor-pointer hover:scale-110 transition shadow-sm bg-slate-900/10 flex-shrink-0"
+                title="Click to enlarge image"
+              >
+                <img src={imgSrc} alt={`Attachment ${idx + 1}`} className="w-full h-full object-cover" />
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const nextImgs = (sticky.images || []).filter((_, i) => i !== idx);
+                    ctx.current.updateStickyNote(sticky.id, { images: nextImgs });
+                    if (
+                      expandedStickyAttachment?.stickyId === sticky.id &&
+                      expandedStickyAttachment?.type === 'image' &&
+                      expandedStickyAttachment?.index === idx
+                    ) {
+                      ctx.current.setExpandedStickyAttachment(null);
+                    }
+                  }}
+                  className="absolute -top-0.5 -right-0.5 w-3.5 h-3.5 rounded-full bg-rose-600 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition"
+                  title="Remove image"
+                >
+                  <X className="w-2.5 h-2.5" />
+                </button>
+              </div>
+            ))}
+
+            {/* Small PDF Icons */}
+            {(sticky.pdfs || []).map((pdfItem, idx) => (
+              <div
+                key={`pdf-${idx}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  ctx.current.openStickyPdfInNewTab(pdfItem);
+                }}
+                className="relative group h-7 px-1.5 rounded-md border border-rose-500/40 bg-rose-600/15 hover:bg-rose-600/25 cursor-pointer hover:scale-105 transition shadow-sm flex items-center gap-1 max-w-[84px]"
+                title={`${pdfItem.name} (Click to open in new tab)`}
+              >
+                <FileText className="w-3.5 h-3.5 text-rose-600 flex-shrink-0" />
+                <span className="text-[9px] font-bold truncate">{pdfItem.name}</span>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const nextPdfs = (sticky.pdfs || []).filter((_, i) => i !== idx);
+                    ctx.current.updateStickyNote(sticky.id, { pdfs: nextPdfs });
+                  }}
+                  className="ml-0.5 w-3.5 h-3.5 rounded-full bg-rose-600 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition flex-shrink-0"
+                  title="Remove PDF"
+                >
+                  <X className="w-2.5 h-2.5" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Bottom-Right Resize Handle */}
+        <div
+          onMouseDown={(e) => {
+            e.stopPropagation();
+            ctx.current.setSelectedStickyId(sticky.id);
+            ctx.current.setResizingStickyId(sticky.id);
+            ctx.current.setStickyResizeStart({
+              mouseX: e.clientX,
+              mouseY: e.clientY,
+              w: sticky.width,
+              h: sticky.height
+            });
+          }}
+          className="absolute bottom-0 right-0 w-4 h-4 cursor-nwse-resize flex items-end justify-end p-0.5 opacity-60 hover:opacity-100"
+          title="Drag corner to resize sticky note"
+        >
+          <div
+            className="w-2.5 h-2.5 border-r-2 border-b-2 rounded-br-[2px]"
+            style={{ borderColor: textColor }}
+          />
+        </div>
+      </div>
+  );
+};
+
+const areStickyPropsEqual = (a: any, b: any) =>
+  a.sticky === b.sticky &&
+  a.isSelected === b.isSelected &&
+  a.isColorOpen === b.isColorOpen &&
+  a.expandedStickyAttachment === b.expandedStickyAttachment;
+
+const StickyNoteCard = React.memo(StickyNoteBase, areStickyPropsEqual);
+
 export default function App() {
   // Multi-Tab Sheet State
   const [tabs, setTabs] = useState([
@@ -536,7 +1055,6 @@ export default function App() {
   const [noteImages, setNoteImages] = useState([]);
 
   const containerRef = useRef(null);
-  const nodeRefs = useRef({});
 
   // Sticky Note Interaction States
   const [selectedStickyId, setSelectedStickyId] = useState(null);
@@ -565,20 +1083,18 @@ export default function App() {
     if (remainingSlots <= 0) return;
 
     files.slice(0, remainingSlots).forEach((file) => {
-      const reader = new FileReader();
-      reader.onload = (event) => {
-        if (event.target?.result) {
+      readImageFile(file)
+        .then((dataUrl) => {
           setStickyNotes((prev) =>
             prev.map((s) => {
               if (s.id !== stickyId) return s;
               const imgs = s.images || [];
               if (imgs.length >= 10) return s;
-              return { ...s, images: [...imgs, event.target.result] };
+              return { ...s, images: [...imgs, dataUrl] };
             })
           );
-        }
-      };
-      reader.readAsDataURL(file);
+        })
+        .catch(() => console.error('Failed to read image'));
     });
     e.target.value = '';
   };
@@ -622,23 +1138,15 @@ export default function App() {
       const base64Parts = pdfItem.data.split(',');
       const base64Content = base64Parts.length > 1 ? base64Parts[1] : base64Parts[0];
       const byteCharacters = atob(base64Content);
-      const byteNumbers = new Array(byteCharacters.length);
+      const byteArray = new Uint8Array(byteCharacters.length);
       for (let i = 0; i < byteCharacters.length; i++) {
-        byteNumbers[i] = byteCharacters.charCodeAt(i);
+        byteArray[i] = byteCharacters.charCodeAt(i);
       }
-      const byteArray = new Uint8Array(byteNumbers);
       const blob = new Blob([byteArray], { type: 'application/pdf' });
       const blobUrl = URL.createObjectURL(blob);
-      const newWindow = window.open(blobUrl, '_blank', 'noopener,noreferrer');
-      if (!newWindow) {
-        const link = document.createElement('a');
-        link.href = blobUrl;
-        link.target = '_blank';
-        link.rel = 'noopener noreferrer';
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
-      }
+      // With 'noopener', window.open always returns null, so there is no fallback here
+      // (the old fallback opened the PDF a second time).
+      window.open(blobUrl, '_blank', 'noopener,noreferrer');
       setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
     } catch (err) {
       window.open(pdfItem.data, '_blank', 'noopener,noreferrer');
@@ -647,7 +1155,7 @@ export default function App() {
 
   // Tab Management Helpers
   const addNewTab = () => {
-    const newTabId = `tab-${Date.now()}`;
+    const newTabId = genId('tab');
     const newTree = [createDefaultTreeData(`Sheet ${tabs.length + 1}`)];
     setTabs((prev) => [
       ...prev,
@@ -686,7 +1194,7 @@ export default function App() {
     const targetY = customCoords ? customCoords.y - 20 : centerY + offsetStagger;
 
     const newSticky = {
-      id: `sticky-${Date.now()}`,
+      id: genId('sticky'),
       text: 'Write your sticky note here...',
       x: targetX,
       y: targetY,
@@ -764,6 +1272,7 @@ export default function App() {
         if (tab.id === activeTabId) {
           const newHistory = tab.history.slice(0, tab.historyIndex + 1);
           newHistory.push(treesArray);
+          if (newHistory.length > MAX_HISTORY) newHistory.shift();
           return {
             ...tab,
             rootNodes: treesArray,
@@ -840,7 +1349,7 @@ export default function App() {
 
   // Add new standalone parent node on the same tab
   const addStandaloneParentNode = (customCoords = null) => {
-    const newRootId = `root-${Date.now()}`;
+    const newRootId = genId('root');
     const defaultTopY = rootNodes.reduce((acc, r) => {
       const computeH = (n) => {
         const h = n.height || (n.isSmall ? 32 : 42);
@@ -984,7 +1493,7 @@ export default function App() {
 
   // Node Insertion Helpers
   const addChildNode = (parentId, isSmall = false) => {
-    const newChildId = `node-${Date.now()}`;
+    const newChildId = genId('node');
     const parentNode = findNode(rootNodes, parentId);
     const parentColorIndex = parentNode ? parentNode.colorIndex : 1;
 
@@ -1021,7 +1530,7 @@ export default function App() {
     const parentNode = findParentNode(rootNodes, targetId);
     if (!parentNode) return;
 
-    const newSiblingId = `node-${Date.now()}`;
+    const newSiblingId = genId('node');
     const targetNode = findNode(rootNodes, targetId);
     const colorIndex = targetNode ? targetNode.colorIndex : 1;
 
@@ -1282,16 +1791,14 @@ export default function App() {
     const filesToProcess = files.slice(0, remainingSlots);
 
     filesToProcess.forEach((file) => {
-      const reader = new FileReader();
-      reader.onload = (event) => {
-        if (event.target?.result) {
+      readImageFile(file)
+        .then((dataUrl) => {
           setNoteImages((prev) => {
             if (prev.length >= 10) return prev;
-            return [...prev, event.target.result];
+            return [...prev, dataUrl];
           });
-        }
-      };
-      reader.readAsDataURL(file);
+        })
+        .catch(() => console.error('Failed to read image'));
     });
   };
 
@@ -1346,45 +1853,68 @@ export default function App() {
       rootNodes,
       stickyNotes
     };
-    const dataStr = 'data:text/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(exportPayload, null, 2));
+    const blob = new Blob([JSON.stringify(exportPayload, null, 2)], { type: 'application/json' });
+    const blobUrl = URL.createObjectURL(blob);
     const downloadAnchor = document.createElement('a');
-    downloadAnchor.setAttribute('href', dataStr);
+    downloadAnchor.setAttribute('href', blobUrl);
     downloadAnchor.setAttribute('download', 'mindmap.json');
     document.body.appendChild(downloadAnchor);
     downloadAnchor.click();
     downloadAnchor.remove();
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
   };
 
   const importJSON = (e) => {
+    const input = e.target;
+    const file = input.files && input.files[0];
+    if (!file) return;
+
     const fileReader = new FileReader();
-    if (e.target.files && e.target.files[0]) {
-      fileReader.readAsText(e.target.files[0], 'UTF-8');
-      fileReader.onload = (event) => {
-        try {
-          const parsedData = JSON.parse(event.target.result);
-          if (parsedData && typeof parsedData === 'object' && !Array.isArray(parsedData) && parsedData.rootNodes) {
-            const treesArray = Array.isArray(parsedData.rootNodes) ? parsedData.rootNodes : [parsedData.rootNodes];
-            const importedStickies = Array.isArray(parsedData.stickyNotes) ? parsedData.stickyNotes : [];
-            setStickyNotes(importedStickies);
-            updateTree(treesArray);
-            setSelectedNodeId(treesArray[0]?.id || null);
-          } else {
-            const treesArray = Array.isArray(parsedData) ? parsedData : [parsedData];
-            updateTree(treesArray);
-            setSelectedNodeId(treesArray[0]?.id || null);
-          }
-        } catch (err) {
-          console.error('Failed to parse JSON file');
+    fileReader.onerror = () => {
+      alert('Could not read that file.');
+      input.value = '';
+    };
+    fileReader.onload = (event) => {
+      try {
+        const parsedData = JSON.parse(event.target.result);
+        let rawTrees;
+        let rawStickies = null;
+
+        if (parsedData && typeof parsedData === 'object' && !Array.isArray(parsedData) && parsedData.rootNodes) {
+          rawTrees = Array.isArray(parsedData.rootNodes) ? parsedData.rootNodes : [parsedData.rootNodes];
+          rawStickies = Array.isArray(parsedData.stickyNotes) ? parsedData.stickyNotes : [];
+        } else {
+          rawTrees = Array.isArray(parsedData) ? parsedData : [parsedData];
         }
-      };
-    }
+
+        // Keep only things that look like mind-map nodes
+        rawTrees = rawTrees.filter((t) => t && typeof t === 'object' && ('text' in t || 'children' in t));
+        if (rawTrees.length === 0) throw new Error('No mind map data found');
+
+        const seen = new Set<string>();
+        const treesArray = rawTrees.map((t) => normalizeNode(t, seen));
+        if (rawStickies) {
+          setStickyNotes(
+            rawStickies.filter((s) => s && typeof s === 'object').map((s) => normalizeSticky(s, seen))
+          );
+        }
+        updateTree(treesArray);
+        setSelectedNodeId(treesArray[0].id);
+      } catch (err) {
+        console.error('Failed to import JSON file', err);
+        alert('That file is not a valid mind map JSON.');
+      } finally {
+        input.value = ''; // allows importing the same file again
+      }
+    };
+    fileReader.readAsText(file, 'UTF-8');
   };
 
   // Markdown Converter
   const generateMarkdown = (node, depth = 0) => {
     const indent = '  '.repeat(depth);
     const emojiStr = node.emoji ? `${node.emoji} ` : '';
-    let result = `${indent}- ${emojiStr}${node.text}\n`;
+    let result = `${indent}- ${emojiStr}${node.text || ''}\n`;
     if (node.children && node.children.length > 0) {
       node.children.forEach((child) => {
         result += generateMarkdown(child, depth + 1);
@@ -1401,7 +1931,7 @@ export default function App() {
     if (stickyNotes.length > 0) {
       md += `## Sticky Notes\n`;
       stickyNotes.forEach((sticky, idx) => {
-        md += `- **Note ${idx + 1}:** ${sticky.text.replace(/\n/g, ' ')}\n`;
+        md += `- **Note ${idx + 1}:** ${(sticky.text || '').replace(/\n/g, ' ')}\n`;
       });
     }
     setMarkdownContent(md);
@@ -1574,20 +2104,24 @@ export default function App() {
       setSelectedNodeId, setSelectedStickyId, setOpenStickyColorId,
       setEditingText, setEditingNodeId, setDraggingNodeId, setDragStartPos,
       setInitialNodeOffset, setDraggedNodeId, setDragOverNodeId,
-      setResizingNodeId, setResizeStart, setNoteText, setNoteImages, setEditingNoteNodeId
+      setResizingNodeId, setResizeStart, setNoteText, setNoteImages, setEditingNoteNodeId,
+      setDraggingStickyId, setStickyDragStart, setExpandedStickyAttachment,
+      setResizingStickyId, setStickyResizeStart,
+      updateStickyNote, toggleStickyZoomEnlarge, deleteStickyNote,
+      handleStickyImageUpload, handleStickyPdfUpload, openStickyPdfInNewTab
     };
   });
 
   // Search Filter Check
   const isSearchMatch = (node) => {
     if (!searchQuery.trim()) return false;
-    return node.text.toLowerCase().includes(searchQuery.toLowerCase());
+    return (node.text || '').toLowerCase().includes(searchQuery.toLowerCase());
   };
 
   return (
     <div className={`w-screen h-screen flex flex-col overflow-hidden select-none font-sans ${darkMode ? 'dark bg-slate-950 text-slate-100' : 'bg-slate-50 text-slate-900'}`}>
       {/* Top Navigation & Sheet Tabs Header */}
-      <div className="flex flex-col border-b border-slate-800 bg-slate-900/95 backdrop-blur-md z-30">
+      <div className="flex flex-col border-b border-slate-800 bg-slate-900/95 z-30">
         {/* Main App Bar */}
         <div className="h-14 px-4 flex items-center justify-between gap-2">
           <div className="flex items-center space-x-2.5">
@@ -1802,7 +2336,7 @@ export default function App() {
         {pendingPlacementMode && (
           <div
             onMouseDown={(e) => e.stopPropagation()}
-            className="fixed top-28 left-1/2 -translate-x-1/2 z-40 px-4 py-2 rounded-full bg-indigo-600/95 border border-indigo-400 text-white text-xs font-semibold shadow-2xl backdrop-blur-md flex items-center gap-3 animate-fade-in"
+            className="fixed top-28 left-1/2 -translate-x-1/2 z-40 px-4 py-2 rounded-full bg-indigo-600/95 border border-indigo-400 text-white text-xs font-semibold shadow-2xl flex items-center gap-3 animate-fade-in"
           >
             <span>
               Click anywhere on the canvas to place your{' '}
@@ -1821,7 +2355,7 @@ export default function App() {
         {/* Node Toolbar Popover (Locked at the Bottom Section of the Canvas when a Node is Selected) */}
         {showNodeOverlay && selectedNodeId && nodeCoords[selectedNodeId] && (
           <div
-            className="fixed bottom-20 left-1/2 -translate-x-1/2 z-30 flex flex-col gap-1.5 p-2.5 rounded-2xl border shadow-2xl bg-slate-900/95 border-slate-700/80 text-white backdrop-blur-md transition-all pointer-events-auto max-w-[95vw]"
+            className="fixed bottom-20 left-1/2 -translate-x-1/2 z-30 flex flex-col gap-1.5 p-2.5 rounded-2xl border shadow-2xl bg-slate-900/95 border-slate-700/80 text-white transition-all pointer-events-auto max-w-[95vw]"
             onMouseDown={(e) => e.stopPropagation()}
             onClick={(e) => e.stopPropagation()}
           >
@@ -2088,24 +2622,7 @@ export default function App() {
         >
           {/* SVG Connection Lines */}
           <svg className="absolute top-0 left-0 w-[10000px] h-[10000px] overflow-visible pointer-events-none">
-            {lines.map((line) => {
-              const strokeColor = line.customColor
-                ? line.customColor
-                : (COLOR_PALETTE[line.colorIndex] || COLOR_PALETTE[1]).accent;
-              const deltaX = Math.abs(line.x2 - line.x1) * 0.5;
-              const pathData = `M ${line.x1} ${line.y1} C ${line.x1 + deltaX} ${line.y1}, ${line.x2 - deltaX} ${line.y2}, ${line.x2} ${line.y2}`;
-              return (
-                <path
-                  key={line.id}
-                  d={pathData}
-                  fill="none"
-                  stroke={strokeColor}
-                  strokeWidth="3"
-                  strokeLinecap="round"
-                  className="transition-opacity duration-300 opacity-80 hover:opacity-100"
-                />
-              );
-            })}
+            <ConnectionLines lines={lines} />
 
             {/* Alignment Guide Lines (Snapped axes while dragging) */}
             {alignmentGuides.x !== null && (
@@ -2148,413 +2665,30 @@ export default function App() {
                 editingText={editingNodeId === nodeId ? editingText : ''}
                 draggedNodeId={draggedNodeId}
                 ctx={nodeCtx}
-                nodeRefs={nodeRefs}
               />
             );
           })}
 
-          {/* Render Free-Positioning Sticky Notes */}
-          {stickyNotes.map((sticky) => {
-            const isSelected = selectedStickyId === sticky.id;
-            const textColor = getContrastTextColor(sticky.color);
-            const isDarkBg = textColor === '#f8fafc';
-
-            return (
-              <div
-                key={sticky.id}
-                style={{
-                  left: `${sticky.x}px`,
-                  top: `${sticky.y}px`,
-                  width: `${sticky.width}px`,
-                  height: `${sticky.height}px`,
-                  backgroundColor: sticky.color,
-                  borderColor: sticky.borderColor || 'rgba(0,0,0,0.18)',
-                  color: textColor
-                }}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setSelectedStickyId(sticky.id);
-                  setSelectedNodeId(null);
-                }}
-                onDoubleClick={(e) => {
-                  e.stopPropagation();
-                  toggleStickyZoomEnlarge(sticky);
-                }}
-                className={`absolute pointer-events-auto rounded-xl border-2 shadow-2xl flex flex-col transition-[background-color,border-color,box-shadow,transform,scale,opacity] duration-200 ${
-                  isSelected ? 'ring-4 ring-indigo-500/80 z-30' : 'z-20'
-                }`}
-              >
-                {/* Sticky Note Top Drag & Control Bar */}
-                <div
-                  onMouseDown={(e) => {
-                    e.stopPropagation();
-                    setSelectedStickyId(sticky.id);
-                    setSelectedNodeId(null);
-                    if (!sticky.isPinned) {
-                      setDraggingStickyId(sticky.id);
-                      setStickyDragStart({
-                        mouseX: e.clientX,
-                        mouseY: e.clientY,
-                        noteX: sticky.x,
-                        noteY: sticky.y
-                      });
-                    }
-                  }}
-                  className={`h-8 px-2 flex items-center justify-between border-b select-none rounded-t-[10px] ${
-                    sticky.isPinned ? 'cursor-default' : 'cursor-grab active:cursor-grabbing'
-                  }`}
-                  style={{
-                    borderColor: isDarkBg ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.1)',
-                    backgroundColor: isDarkBg ? 'rgba(0,0,0,0.2)' : 'rgba(0,0,0,0.05)'
-                  }}
-                >
-                  {/* Pin / Lock Position Toggle & Font Controls */}
-                  <div className="flex items-center space-x-1">
-                    <button
-                      onMouseDown={(e) => e.stopPropagation()}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        updateStickyNote(sticky.id, { isPinned: !sticky.isPinned });
-                      }}
-                      className={`p-1 rounded-md transition ${
-                        sticky.isPinned
-                          ? 'bg-rose-600 text-white shadow-sm'
-                          : isDarkBg
-                          ? 'hover:bg-white/10 text-slate-200'
-                          : 'hover:bg-black/10 text-slate-700'
-                      }`}
-                      title={sticky.isPinned ? 'Unpin Sticky Note (L)' : 'Pin / Lock Sticky Note Position (L)'}
-                    >
-                      <Pin className="w-3.5 h-3.5" />
-                    </button>
-
-                    {/* Font Family Selector */}
-                    <select
-                      value={sticky.fontFamily || 'sans'}
-                      onMouseDown={(e) => e.stopPropagation()}
-                      onClick={(e) => e.stopPropagation()}
-                      onChange={(e) => updateStickyNote(sticky.id, { fontFamily: e.target.value })}
-                      className={`text-[10px] font-semibold rounded px-1 py-0.5 outline-none cursor-pointer border ${
-                        isDarkBg
-                          ? 'bg-slate-800 border-slate-700 text-slate-200'
-                          : 'bg-white/70 border-black/15 text-slate-800'
-                      }`}
-                      title="Font Family"
-                    >
-                      <option value="sans" className="text-slate-900 bg-white">Sans</option>
-                      <option value="serif" className="text-slate-900 bg-white">Serif</option>
-                      <option value="mono" className="text-slate-900 bg-white">Mono</option>
-                    </select>
-
-                    {/* Font Size Decrease / Increase */}
-                    <div className="flex items-center">
-                      <button
-                        onMouseDown={(e) => e.stopPropagation()}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          const nextSize = Math.max(10, (sticky.fontSize || 13) - 2);
-                          updateStickyNote(sticky.id, { fontSize: nextSize });
-                        }}
-                        className={`px-1 py-0.5 rounded text-[10px] font-bold transition ${
-                          isDarkBg ? 'hover:bg-white/10 text-slate-200' : 'hover:bg-black/10 text-slate-800'
-                        }`}
-                        title="Decrease Font Size"
-                      >
-                        A-
-                      </button>
-                      <button
-                        onMouseDown={(e) => e.stopPropagation()}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          const nextSize = Math.min(36, (sticky.fontSize || 13) + 2);
-                          updateStickyNote(sticky.id, { fontSize: nextSize });
-                        }}
-                        className={`px-1 py-0.5 rounded text-[10px] font-bold transition ${
-                          isDarkBg ? 'hover:bg-white/10 text-slate-200' : 'hover:bg-black/10 text-slate-800'
-                        }`}
-                        title="Increase Font Size"
-                      >
-                        A+
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Right Actions: Color Palette, Enlarge/Zoom & Delete */}
-                  <div className="flex items-center space-x-0.5 relative">
-                    {/* Upload Images (Max 10) */}
-                    <label
-                      onMouseDown={(e) => e.stopPropagation()}
-                      onClick={(e) => e.stopPropagation()}
-                      className={`p-1 rounded-md transition cursor-pointer ${
-                        (sticky.images?.length || 0) >= 10
-                          ? 'opacity-40 cursor-not-allowed'
-                          : isDarkBg
-                          ? 'hover:bg-white/10 text-slate-200'
-                          : 'hover:bg-black/10 text-slate-700'
-                      }`}
-                      title={`Upload Images (${sticky.images?.length || 0}/10)`}
-                    >
-                      <ImageIcon className="w-3.5 h-3.5" />
-                      <input
-                        type="file"
-                        accept="image/*"
-                        multiple
-                        disabled={(sticky.images?.length || 0) >= 10}
-                        onChange={(e) => handleStickyImageUpload(sticky.id, e)}
-                        className="hidden"
-                      />
-                    </label>
-
-                    {/* Upload PDFs (Max 10) */}
-                    <label
-                      onMouseDown={(e) => e.stopPropagation()}
-                      onClick={(e) => e.stopPropagation()}
-                      className={`p-1 rounded-md transition cursor-pointer ${
-                        (sticky.pdfs?.length || 0) >= 10
-                          ? 'opacity-40 cursor-not-allowed'
-                          : isDarkBg
-                          ? 'hover:bg-white/10 text-slate-200'
-                          : 'hover:bg-black/10 text-slate-700'
-                      }`}
-                      title={`Upload PDFs (${sticky.pdfs?.length || 0}/10)`}
-                    >
-                      <File className="w-3.5 h-3.5" />
-                      <input
-                        type="file"
-                        accept="application/pdf,.pdf"
-                        multiple
-                        disabled={(sticky.pdfs?.length || 0) >= 10}
-                        onChange={(e) => handleStickyPdfUpload(sticky.id, e)}
-                        className="hidden"
-                      />
-                    </label>
-
-                    <button
-                      onMouseDown={(e) => e.stopPropagation()}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setOpenStickyColorId(openStickyColorId === sticky.id ? null : sticky.id);
-                      }}
-                      className={`p-1 rounded-md transition ${
-                        isDarkBg ? 'hover:bg-white/10 text-slate-200' : 'hover:bg-black/10 text-slate-700'
-                      }`}
-                      title="Change Sticky Note Color"
-                    >
-                      <Palette className="w-3.5 h-3.5" />
-                    </button>
-
-                    <button
-                      onMouseDown={(e) => e.stopPropagation()}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        toggleStickyZoomEnlarge(sticky);
-                      }}
-                      className={`p-1 rounded-md transition ${
-                        sticky.isExpanded
-                          ? 'bg-indigo-600 text-white'
-                          : isDarkBg
-                          ? 'hover:bg-white/10 text-slate-200'
-                          : 'hover:bg-black/10 text-slate-700'
-                      }`}
-                      title={sticky.isExpanded ? 'Restore Sticky Note Size & Zoom' : 'Enlarge & Zoom to Sticky Note (or Double-Click)'}
-                    >
-                      <Maximize2 className="w-3.5 h-3.5" />
-                    </button>
-
-                    <button
-                      onMouseDown={(e) => e.stopPropagation()}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        deleteStickyNote(sticky.id);
-                      }}
-                      className={`p-1 rounded-md transition ${
-                        isDarkBg ? 'hover:bg-rose-500/30 text-rose-300' : 'hover:bg-rose-500/20 text-rose-700'
-                      }`}
-                      title="Delete Sticky Note"
-                    >
-                      <X className="w-3.5 h-3.5" />
-                    </button>
-
-                    {/* Sticky Note Color Preset & Custom Color Popover */}
-                    {openStickyColorId === sticky.id && (
-                      <div
-                        onMouseDown={(e) => e.stopPropagation()}
-                        onClick={(e) => e.stopPropagation()}
-                        className="absolute top-7 right-0 p-2.5 rounded-xl bg-slate-900 border border-slate-700 shadow-2xl z-50 w-44 text-slate-100 flex flex-col gap-2"
-                      >
-                        <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">
-                          Color Presets
-                        </span>
-                        <div className="grid grid-cols-4 gap-1.5">
-                          {STICKY_NOTE_PRESETS.map((preset, idx) => (
-                            <button
-                              key={idx}
-                              onClick={() => {
-                                updateStickyNote(sticky.id, {
-                                  color: preset.bg,
-                                  borderColor: preset.border
-                                });
-                                setOpenStickyColorId(null);
-                              }}
-                              className="w-7 h-7 rounded-lg border border-white/25 hover:scale-110 transition shadow-sm"
-                              style={{ backgroundColor: preset.bg }}
-                              title={preset.label}
-                            />
-                          ))}
-                        </div>
-
-                        <div className="pt-1.5 border-t border-slate-800 flex items-center justify-between">
-                          <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">
-                            Any Color
-                          </span>
-                          <input
-                            type="color"
-                            value={sticky.color}
-                            onChange={(e) =>
-                              updateStickyNote(sticky.id, {
-                                color: e.target.value,
-                                borderColor: e.target.value
-                              })
-                            }
-                            className="w-7 h-7 rounded cursor-pointer bg-transparent border-0 p-0"
-                            title="Pick Any Custom Color"
-                          />
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-                {/* Sticky Note Editable Body */}
-                <textarea
-                  value={sticky.text}
-                  onMouseDown={(e) => e.stopPropagation()}
-                  onDoubleClick={(e) => {
-                    e.stopPropagation();
-                    toggleStickyZoomEnlarge(sticky);
-                  }}
-                  onFocus={() => {
-                    setSelectedStickyId(sticky.id);
-                    setSelectedNodeId(null);
-                  }}
-                  onChange={(e) => updateStickyNote(sticky.id, { text: e.target.value })}
-                  placeholder="Write sticky note..."
-                  className={`flex-1 w-full p-2.5 bg-transparent resize-none outline-none font-medium leading-relaxed ${
-                    sticky.fontFamily === 'serif'
-                      ? 'font-serif'
-                      : sticky.fontFamily === 'mono'
-                      ? 'font-mono'
-                      : 'font-sans'
-                  }`}
-                  style={{
-                    color: textColor,
-                    fontSize: `${sticky.fontSize || 13}px`
-                  }}
-                />
-
-                {/* Shrunk Attachment Icons Strip (Images & PDFs) */}
-                {((sticky.images && sticky.images.length > 0) || (sticky.pdfs && sticky.pdfs.length > 0)) && (
-                  <div
-                    onMouseDown={(e) => e.stopPropagation()}
-                    onDoubleClick={(e) => e.stopPropagation()}
-                    className="px-2 pb-2 pt-1 flex flex-wrap gap-1.5 border-t"
-                    style={{
-                      borderColor: isDarkBg ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.1)'
-                    }}
-                  >
-                    {/* Small Image Thumbnail Icons */}
-                    {(sticky.images || []).map((imgSrc, idx) => (
-                      <div
-                        key={`img-${idx}`}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setExpandedStickyAttachment({ stickyId: sticky.id, type: 'image', index: idx });
-                        }}
-                        className="relative group w-7 h-7 rounded-md overflow-hidden border border-black/25 cursor-pointer hover:scale-110 transition shadow-sm bg-slate-900/10 flex-shrink-0"
-                        title="Click to enlarge image"
-                      >
-                        <img src={imgSrc} alt={`Attachment ${idx + 1}`} className="w-full h-full object-cover" />
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            const nextImgs = (sticky.images || []).filter((_, i) => i !== idx);
-                            updateStickyNote(sticky.id, { images: nextImgs });
-                            if (
-                              expandedStickyAttachment?.stickyId === sticky.id &&
-                              expandedStickyAttachment?.type === 'image' &&
-                              expandedStickyAttachment?.index === idx
-                            ) {
-                              setExpandedStickyAttachment(null);
-                            }
-                          }}
-                          className="absolute -top-0.5 -right-0.5 w-3.5 h-3.5 rounded-full bg-rose-600 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition"
-                          title="Remove image"
-                        >
-                          <X className="w-2.5 h-2.5" />
-                        </button>
-                      </div>
-                    ))}
-
-                    {/* Small PDF Icons */}
-                    {(sticky.pdfs || []).map((pdfItem, idx) => (
-                      <div
-                        key={`pdf-${idx}`}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          openStickyPdfInNewTab(pdfItem);
-                        }}
-                        className="relative group h-7 px-1.5 rounded-md border border-rose-500/40 bg-rose-600/15 hover:bg-rose-600/25 cursor-pointer hover:scale-105 transition shadow-sm flex items-center gap-1 max-w-[84px]"
-                        title={`${pdfItem.name} (Click to open in new tab)`}
-                      >
-                        <FileText className="w-3.5 h-3.5 text-rose-600 flex-shrink-0" />
-                        <span className="text-[9px] font-bold truncate">{pdfItem.name}</span>
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            const nextPdfs = (sticky.pdfs || []).filter((_, i) => i !== idx);
-                            updateStickyNote(sticky.id, { pdfs: nextPdfs });
-                          }}
-                          className="ml-0.5 w-3.5 h-3.5 rounded-full bg-rose-600 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition flex-shrink-0"
-                          title="Remove PDF"
-                        >
-                          <X className="w-2.5 h-2.5" />
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {/* Bottom-Right Resize Handle */}
-                <div
-                  onMouseDown={(e) => {
-                    e.stopPropagation();
-                    setSelectedStickyId(sticky.id);
-                    setResizingStickyId(sticky.id);
-                    setStickyResizeStart({
-                      mouseX: e.clientX,
-                      mouseY: e.clientY,
-                      w: sticky.width,
-                      h: sticky.height
-                    });
-                  }}
-                  className="absolute bottom-0 right-0 w-4 h-4 cursor-nwse-resize flex items-end justify-end p-0.5 opacity-60 hover:opacity-100"
-                  title="Drag corner to resize sticky note"
-                >
-                  <div
-                    className="w-2.5 h-2.5 border-r-2 border-b-2 rounded-br-[2px]"
-                    style={{ borderColor: textColor }}
-                  />
-                </div>
-              </div>
-            );
-          })}
+          {/* Render Free-Positioning Sticky Notes (memoized) */}
+          {stickyNotes.map((sticky) => (
+            <StickyNoteCard
+              key={sticky.id}
+              sticky={sticky}
+              isSelected={selectedStickyId === sticky.id}
+              isColorOpen={openStickyColorId === sticky.id}
+              expandedStickyAttachment={
+                expandedStickyAttachment?.stickyId === sticky.id ? expandedStickyAttachment : null
+              }
+              ctx={nodeCtx}
+            />
+          ))}
         </div>
 
         {/* Floating Zoom & Controls Bar */}
         <div className="fixed bottom-6 right-6 flex items-center space-x-2 z-20 pointer-events-auto">
           <button
             onClick={() => setShowNodeOverlay(!showNodeOverlay)}
-            className={`px-3 py-2 rounded-xl border shadow-lg backdrop-blur-md transition flex items-center gap-1.5 text-xs font-medium ${
+            className={`px-3 py-2 rounded-xl border shadow-lg transition flex items-center gap-1.5 text-xs font-medium ${
               showNodeOverlay
                 ? 'bg-slate-900/90 border-slate-700 text-slate-200 hover:bg-slate-800'
                 : 'bg-indigo-600/90 border-indigo-500 text-white hover:bg-indigo-500 shadow-indigo-600/30'
@@ -2567,14 +2701,14 @@ export default function App() {
 
           <button
             onClick={resetAutoLayout}
-            className="px-3 py-2 rounded-xl border shadow-lg backdrop-blur-md bg-slate-900/90 border-slate-700 text-slate-200 hover:bg-slate-800 transition flex items-center gap-1.5 text-xs font-medium"
+            className="px-3 py-2 rounded-xl border shadow-lg bg-slate-900/90 border-slate-700 text-slate-200 hover:bg-slate-800 transition flex items-center gap-1.5 text-xs font-medium"
             title="Reset Free Node Positions to Auto Tree Alignment"
           >
             <Layout className="w-4 h-4 text-indigo-400" />
             Auto Layout
           </button>
 
-          <div className="flex items-center space-x-1 p-1 rounded-xl border shadow-lg backdrop-blur-md bg-slate-900/90 border-slate-700 text-slate-200">
+          <div className="flex items-center space-x-1 p-1 rounded-xl border shadow-lg bg-slate-900/90 border-slate-700 text-slate-200">
             <button
               onClick={() => setTransform((prev) => ({ ...prev, scale: Math.min(prev.scale * 1.2, 3) }))}
               className="p-2 rounded-lg hover:bg-slate-800/50 transition"
@@ -2601,7 +2735,7 @@ export default function App() {
         </div>
 
         {/* Quick Help Floating Tip Banner */}
-        <div className="fixed bottom-6 left-6 hidden md:flex items-center space-x-3 px-4 py-2 rounded-xl border shadow-lg backdrop-blur-md bg-slate-900/80 border-slate-800 text-xs text-slate-400 z-20 pointer-events-auto">
+        <div className="fixed bottom-6 left-6 hidden md:flex items-center space-x-3 px-4 py-2 rounded-xl border shadow-lg bg-slate-900/80 border-slate-800 text-xs text-slate-400 z-20 pointer-events-auto">
           <span className="flex items-center gap-1 font-medium text-slate-300">
             <kbd className="px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono text-[11px]">Drag Node</kbd>
             Move Freely
