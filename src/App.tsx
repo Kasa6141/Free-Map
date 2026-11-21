@@ -39,7 +39,10 @@ import {
   Unlock,
   Pin,
   File,
-  Minimize2
+  Minimize2,
+  Settings,
+  Keyboard,
+  ChevronLeft
 } from 'lucide-react';
 
 // Preset Palette Colors for Nodes
@@ -177,6 +180,313 @@ const normalizeSticky = (raw: any, seen: Set<string>): any => {
     images: Array.isArray(s.images) ? s.images : [],
     pdfs: Array.isArray(s.pdfs) ? s.pdfs : []
   };
+};
+
+// ---------- Downloads & file explorer helpers ----------
+const MIME_EXT: Record<string, string> = {
+  'image/png': 'png', 'image/jpeg': 'jpg', 'image/jpg': 'jpg', 'image/webp': 'webp',
+  'image/gif': 'gif', 'image/svg+xml': 'svg', 'application/pdf': 'pdf'
+};
+
+const mimeOfDataUrl = (dataUrl: string) => {
+  const m = /^data:([^;,]+)/i.exec(dataUrl || '');
+  return m ? m[1].toLowerCase() : 'application/octet-stream';
+};
+
+const dataUrlToBytes = (dataUrl: string) => {
+  const comma = dataUrl.indexOf(',');
+  const meta = dataUrl.slice(5, comma);
+  const payload = dataUrl.slice(comma + 1);
+  if (/;base64/i.test(meta)) {
+    const bin = atob(payload);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  }
+  return new TextEncoder().encode(decodeURIComponent(payload));
+};
+
+const safeName = (s: string) =>
+  (s || '').replace(/[\\/:*?"<>|\u0000-\u001f…]/g, '').replace(/\s+/g, ' ').trim() || 'file';
+
+const triggerDownload = (blob: Blob, filename: string) => {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+};
+
+// Minimal store-only ZIP writer (no compression, no dependencies)
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+
+const crc32 = (buf: Uint8Array) => {
+  let c = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+};
+
+const buildZip = (files: { path: string; bytes: Uint8Array }[]): Blob => {
+  const enc = new TextEncoder();
+  const parts: any[] = [];
+  const central: any[] = [];
+  let offset = 0;
+  const now = new Date();
+  const dosTime = (now.getHours() << 11) | (now.getMinutes() << 5) | Math.floor(now.getSeconds() / 2);
+  const dosDate = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+
+  files.forEach((f) => {
+    const name = enc.encode(f.path);
+    const crc = crc32(f.bytes);
+    const size = f.bytes.length;
+
+    const local = new DataView(new ArrayBuffer(30));
+    local.setUint32(0, 0x04034b50, true);
+    local.setUint16(4, 20, true);
+    local.setUint16(6, 0x0800, true); // UTF-8 file names
+    local.setUint16(8, 0, true); // stored
+    local.setUint16(10, dosTime, true);
+    local.setUint16(12, dosDate, true);
+    local.setUint32(14, crc, true);
+    local.setUint32(18, size, true);
+    local.setUint32(22, size, true);
+    local.setUint16(26, name.length, true);
+    local.setUint16(28, 0, true);
+    parts.push(new Uint8Array(local.buffer), name, f.bytes);
+
+    const cen = new DataView(new ArrayBuffer(46));
+    cen.setUint32(0, 0x02014b50, true);
+    cen.setUint16(4, 20, true);
+    cen.setUint16(6, 20, true);
+    cen.setUint16(8, 0x0800, true);
+    cen.setUint16(10, 0, true);
+    cen.setUint16(12, dosTime, true);
+    cen.setUint16(14, dosDate, true);
+    cen.setUint32(16, crc, true);
+    cen.setUint32(20, size, true);
+    cen.setUint32(24, size, true);
+    cen.setUint16(28, name.length, true);
+    cen.setUint32(42, offset, true);
+    central.push(new Uint8Array(cen.buffer), name);
+
+    offset += 30 + name.length + size;
+  });
+
+  const cenSize = central.reduce((sum, c) => sum + c.length, 0);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true);
+  end.setUint16(8, files.length, true);
+  end.setUint16(10, files.length, true);
+  end.setUint32(12, cenSize, true);
+  end.setUint32(16, offset, true);
+
+  return new Blob([...parts, ...central, new Uint8Array(end.buffer)], { type: 'application/zip' });
+};
+
+// Makes every path in a zip unique ("a.png", "a (2).png", ...)
+const dedupePaths = (files: { path: string; bytes: Uint8Array }[]) => {
+  const used = new Map<string, number>();
+  return files.map((f) => {
+    const key = f.path.toLowerCase();
+    const n = (used.get(key) || 0) + 1;
+    used.set(key, n);
+    if (n === 1) return f;
+    const dot = f.path.lastIndexOf('.');
+    const slash = f.path.lastIndexOf('/');
+    return dot > slash
+      ? { ...f, path: `${f.path.slice(0, dot)} (${n})${f.path.slice(dot)}` }
+      : { ...f, path: `${f.path} (${n})` };
+  });
+};
+
+const stickyLabelOf = (sticky: any, idx = 0) => {
+  const t = (sticky?.text || '').replace(/\s+/g, ' ').trim();
+  if (!t) return `Sticky Note ${idx + 1}`;
+  return t.length > 28 ? t.slice(0, 28).trim() + '…' : t;
+};
+
+// Turns an owner's image / pdf lists into a flat file list { kind, index, name, data }
+const buildFileList = (label: string, images: any[] = [], pdfs: any[] = []) => {
+  const base = safeName(label);
+  const list: any[] = [];
+  images.forEach((data, i) => {
+    const ext = MIME_EXT[mimeOfDataUrl(data)] || 'img';
+    list.push({ kind: 'image', index: i, data, name: `${base} - Image ${i + 1}.${ext}` });
+  });
+  pdfs.forEach((p, i) => {
+    let name = safeName(p?.name || `Document ${i + 1}`);
+    if (!/\.pdf$/i.test(name)) name += '.pdf';
+    list.push({ kind: 'pdf', index: i, data: p?.data, name });
+  });
+  return list.filter((f) => typeof f.data === 'string' && f.data.startsWith('data:'));
+};
+
+const downloadFileItem = (file: any) => {
+  try {
+    const blob = new Blob([dataUrlToBytes(file.data)], { type: mimeOfDataUrl(file.data) });
+    triggerDownload(blob, file.name);
+  } catch (err) {
+    console.error('Download failed', err);
+    alert('Could not download that file.');
+  }
+};
+
+// Downloads one file directly, or several as a single .zip
+const downloadFileItems = (files: any[], zipName: string, forceZip = false) => {
+  if (!files.length) return;
+  if (files.length === 1 && !forceZip) {
+    downloadFileItem(files[0]);
+    return;
+  }
+  try {
+    const entries = dedupePaths(
+      files.map((f) => ({ path: (f.folder ? f.folder + '/' : '') + f.name, bytes: dataUrlToBytes(f.data) }))
+    );
+    triggerDownload(buildZip(entries), `${safeName(zipName)}.zip`);
+  } catch (err) {
+    console.error('Zip failed', err);
+    alert('Could not create the download.');
+  }
+};
+
+// Collects every uploaded file across all sheets: sticky-note attachments + node-note images
+const buildFileTree = (tabs: any[]) => {
+  const sheets = (tabs || []).map((tab) => {
+    const stickies = (tab.stickyNotes || [])
+      .map((s: any, idx: number) => {
+        const label = stickyLabelOf(s, idx);
+        return { id: s.id, label, files: buildFileList(label, s.images || [], s.pdfs || []) };
+      })
+      .filter((s: any) => s.files.length > 0);
+
+    const nodes: any[] = [];
+    const walk = (list: any[]) => {
+      (Array.isArray(list) ? list : [list]).forEach((n) => {
+        if (!n) return;
+        if (Array.isArray(n.images) && n.images.length > 0) {
+          const label = (n.text || '').trim() || 'Untitled node';
+          nodes.push({ id: n.id, label, files: buildFileList(label, n.images, []) });
+        }
+        if (Array.isArray(n.children)) walk(n.children);
+      });
+    };
+    walk(tab.rootNodes || []);
+
+    const count =
+      stickies.reduce((a: number, s: any) => a + s.files.length, 0) +
+      nodes.reduce((a: number, n: any) => a + n.files.length, 0);
+    return { tabId: tab.id, title: tab.title || 'Sheet', stickies, nodes, count };
+  });
+  return { sheets, total: sheets.reduce((a, s) => a + s.count, 0) };
+};
+
+// ---------- Hotkey system ----------
+const HOTKEY_ACTIONS = [
+  { id: 'addChild', label: 'Add Child Node' },
+  { id: 'addSibling', label: 'Add Sibling Node' },
+  { id: 'toggleLock', label: 'Lock / Unlock Node or Sticky Position' },
+  { id: 'toggleOverlay', label: 'Toggle Action Overlay' },
+  { id: 'deleteSelected', label: 'Delete Selected Node / Sticky' },
+  { id: 'undo', label: 'Undo' },
+  { id: 'redo', label: 'Redo' },
+  { id: 'toggleFileTree', label: 'Open / Close File Explorer' },
+  { id: 'openSettings', label: 'Open / Close Settings' },
+  { id: 'cancelPlacement', label: 'Cancel Placement Mode' }
+];
+
+const kb = (key: string, mods: { ctrl?: boolean; shift?: boolean; alt?: boolean } = {}) => ({
+  type: 'key', key, ctrl: !!mods.ctrl, shift: !!mods.shift, alt: !!mods.alt
+});
+
+const DEFAULT_KEYBINDS: Record<string, any[]> = {
+  addChild: [kb('Tab')],
+  addSibling: [kb('Enter')],
+  toggleLock: [kb('l')],
+  toggleOverlay: [kb('z')],
+  deleteSelected: [kb('Delete'), kb('Backspace')],
+  undo: [kb('z', { ctrl: true })],
+  redo: [kb('y', { ctrl: true }), kb('z', { ctrl: true, shift: true })],
+  toggleFileTree: [kb('f')],
+  openSettings: [kb(',', { ctrl: true })],
+  cancelPlacement: [kb('Escape')]
+};
+
+const KEYBINDS_STORAGE_KEY = 'freemap-keybinds-v1';
+
+const normKey = (k: string) => (k && k.length === 1 ? k.toLowerCase() : k);
+
+const bindingFromKeyEvent = (e: any) => ({
+  type: 'key', key: normKey(e.key), ctrl: !!(e.ctrlKey || e.metaKey), shift: !!e.shiftKey, alt: !!e.altKey
+});
+
+const bindingFromMouseEvent = (e: any) => ({
+  type: 'mouse', button: e.button, ctrl: !!(e.ctrlKey || e.metaKey), shift: !!e.shiftKey, alt: !!e.altKey
+});
+
+const bindingsEqual = (a: any, b: any) =>
+  a.type === b.type &&
+  (a.type === 'key' ? a.key === b.key : a.button === b.button) &&
+  !!a.ctrl === !!b.ctrl && !!a.shift === !!b.shift && !!a.alt === !!b.alt;
+
+const matchesKeyEvent = (b: any, e: any) => {
+  if (b.type !== 'key' || normKey(e.key) !== b.key) return false;
+  if (!!(e.ctrlKey || e.metaKey) !== b.ctrl || e.altKey !== b.alt) return false;
+  // Plain single letters ignore Shift/CapsLock (so "Z" and "z" both work)
+  const lenient = !b.ctrl && !b.alt && !b.shift && b.key.length === 1 && /[a-z]/.test(b.key);
+  return lenient ? true : e.shiftKey === b.shift;
+};
+
+const matchesMouseEvent = (b: any, e: any) =>
+  b.type === 'mouse' && e.button === b.button &&
+  !!(e.ctrlKey || e.metaKey) === b.ctrl && e.shiftKey === b.shift && e.altKey === b.alt;
+
+const MOUSE_BUTTON_NAMES: Record<number, string> = {
+  1: 'Middle Click', 2: 'Right Click', 3: 'Mouse 4 (Back)', 4: 'Mouse 5 (Forward)'
+};
+
+const KEY_DISPLAY: Record<string, string> = { ' ': 'Space', ArrowUp: '↑', ArrowDown: '↓', ArrowLeft: '←', ArrowRight: '→' };
+
+const formatBinding = (b: any) => {
+  const parts: string[] = [];
+  if (b.ctrl) parts.push('Ctrl');
+  if (b.alt) parts.push('Alt');
+  if (b.shift) parts.push('Shift');
+  if (b.type === 'mouse') parts.push(MOUSE_BUTTON_NAMES[b.button] || `Mouse ${b.button + 1}`);
+  else parts.push(KEY_DISPLAY[b.key] || (b.key.length === 1 ? b.key.toUpperCase() : b.key));
+  return parts.join('+');
+};
+
+const isValidBinding = (b: any) =>
+  b && typeof b === 'object' &&
+  ((b.type === 'key' && typeof b.key === 'string' && b.key.length > 0) ||
+    (b.type === 'mouse' && typeof b.button === 'number' && b.button > 0 && b.button < 10));
+
+const loadKeybinds = (): Record<string, any[]> => {
+  const result: Record<string, any[]> = {};
+  Object.keys(DEFAULT_KEYBINDS).forEach((id) => (result[id] = DEFAULT_KEYBINDS[id].map((b) => ({ ...b }))));
+  try {
+    const raw = localStorage.getItem(KEYBINDS_STORAGE_KEY);
+    if (raw) {
+      const saved = JSON.parse(raw);
+      Object.keys(DEFAULT_KEYBINDS).forEach((id) => {
+        if (Array.isArray(saved?.[id])) result[id] = saved[id].filter(isValidBinding);
+      });
+    }
+  } catch (err) {
+    /* storage unavailable or corrupted: fall back to defaults */
+  }
+  return result;
 };
 
 // Default Tree Builder Helper
@@ -488,12 +798,12 @@ const MapNodeBase = ({ coords, isSelected, isEditing, isDragOver, isMatch, editi
                 ctx.current.setNoteImages(node.images || []);
                 ctx.current.setEditingNoteNodeId(node.id);
               }}
-              className="flex-shrink-0 text-amber-300 hover:text-amber-100 transition flex items-center gap-0.5"
-              title={node.note || 'Contains images'}
+              className="flex-shrink-0 text-amber-300 hover:text-amber-100 hover:bg-amber-500/20 transition flex items-center gap-1 p-1 -m-1 rounded-lg"
+              title={node.note || 'Contains images (click to open)'}
             >
-              <FileText className={node.isSmall ? 'w-2.5 h-2.5' : 'w-3.5 h-3.5'} />
+              <FileText className={node.isSmall ? 'w-3.5 h-3.5' : 'w-[18px] h-[18px]'} />
               {node.images && node.images.length > 0 && (
-                <span className="text-[9px] font-bold px-1 bg-amber-500/80 rounded-full text-slate-900">
+                <span className="text-[10px] font-bold px-1.5 min-w-[16px] text-center bg-amber-500/80 rounded-full text-slate-900">
                   {node.images.length}
                 </span>
               )}
@@ -582,7 +892,7 @@ const ConnectionLines = React.memo(({ lines }: any) => (
 ));
 
 // Single sticky note. Memoized like MapNode; handlers read the latest App functions via `ctx`.
-const StickyNoteBase = ({ sticky, isSelected, isColorOpen, expandedStickyAttachment, ctx }: any) => {
+const StickyNoteBase = ({ sticky, isSelected, isColorOpen, expandedStickyAttachment, lockHint, ctx }: any) => {
   const textColor = getContrastTextColor(sticky.color);
     const isDarkBg = textColor === '#f8fafc';
 
@@ -650,7 +960,7 @@ const StickyNoteBase = ({ sticky, isSelected, isColorOpen, expandedStickyAttachm
                   ? 'hover:bg-white/10 text-slate-200'
                   : 'hover:bg-black/10 text-slate-700'
               }`}
-              title={sticky.isPinned ? 'Unpin Sticky Note (L)' : 'Pin / Lock Sticky Note Position (L)'}
+              title={(sticky.isPinned ? 'Unpin Sticky Note' : 'Pin / Lock Sticky Note Position') + lockHint}
             >
               <Pin className="w-3.5 h-3.5" />
             </button>
@@ -897,10 +1207,21 @@ const StickyNoteBase = ({ sticky, isSelected, isColorOpen, expandedStickyAttachm
                   e.stopPropagation();
                   ctx.current.setExpandedStickyAttachment({ stickyId: sticky.id, type: 'image', index: idx });
                 }}
-                className="relative group w-7 h-7 rounded-md overflow-hidden border border-black/25 cursor-pointer hover:scale-110 transition shadow-sm bg-slate-900/10 flex-shrink-0"
+                className="relative group w-10 h-10 rounded-lg overflow-hidden border border-black/25 cursor-pointer hover:scale-105 transition shadow-sm bg-slate-900/10 flex-shrink-0"
                 title="Click to enlarge image"
               >
                 <img src={imgSrc} alt={`Attachment ${idx + 1}`} className="w-full h-full object-cover" />
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const f = buildFileList(stickyLabelOf(sticky), sticky.images || [], []).find((x) => x.index === idx);
+                    if (f) downloadFileItem(f);
+                  }}
+                  className="absolute bottom-0.5 left-0.5 w-[18px] h-[18px] rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition"
+                  title="Download image"
+                >
+                  <Download className="w-3 h-3" />
+                </button>
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
@@ -914,10 +1235,10 @@ const StickyNoteBase = ({ sticky, isSelected, isColorOpen, expandedStickyAttachm
                       ctx.current.setExpandedStickyAttachment(null);
                     }
                   }}
-                  className="absolute -top-0.5 -right-0.5 w-3.5 h-3.5 rounded-full bg-rose-600 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition"
+                  className="absolute top-0.5 right-0.5 w-[18px] h-[18px] rounded-full bg-rose-600 hover:bg-rose-500 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition"
                   title="Remove image"
                 >
-                  <X className="w-2.5 h-2.5" />
+                  <X className="w-3 h-3" />
                 </button>
               </div>
             ))}
@@ -930,24 +1251,54 @@ const StickyNoteBase = ({ sticky, isSelected, isColorOpen, expandedStickyAttachm
                   e.stopPropagation();
                   ctx.current.openStickyPdfInNewTab(pdfItem);
                 }}
-                className="relative group h-7 px-1.5 rounded-md border border-rose-500/40 bg-rose-600/15 hover:bg-rose-600/25 cursor-pointer hover:scale-105 transition shadow-sm flex items-center gap-1 max-w-[84px]"
+                className="relative group h-10 px-2 rounded-lg border border-rose-500/40 bg-rose-600/15 hover:bg-rose-600/25 cursor-pointer hover:scale-105 transition shadow-sm flex items-center gap-1.5 max-w-[140px]"
                 title={`${pdfItem.name} (Click to open in new tab)`}
               >
-                <FileText className="w-3.5 h-3.5 text-rose-600 flex-shrink-0" />
-                <span className="text-[9px] font-bold truncate">{pdfItem.name}</span>
+                <FileText className="w-4 h-4 text-rose-600 flex-shrink-0" />
+                <span className="text-[10px] font-bold truncate">{pdfItem.name}</span>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const f = buildFileList(stickyLabelOf(sticky), [], sticky.pdfs || []).find((x) => x.index === idx);
+                    if (f) downloadFileItem(f);
+                  }}
+                  className="ml-0.5 w-[18px] h-[18px] rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition flex-shrink-0"
+                  title="Download PDF"
+                >
+                  <Download className="w-3 h-3" />
+                </button>
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
                     const nextPdfs = (sticky.pdfs || []).filter((_, i) => i !== idx);
                     ctx.current.updateStickyNote(sticky.id, { pdfs: nextPdfs });
                   }}
-                  className="ml-0.5 w-3.5 h-3.5 rounded-full bg-rose-600 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition flex-shrink-0"
+                  className="w-[18px] h-[18px] rounded-full bg-rose-600 hover:bg-rose-500 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition flex-shrink-0"
                   title="Remove PDF"
                 >
-                  <X className="w-2.5 h-2.5" />
+                  <X className="w-3 h-3" />
                 </button>
               </div>
             ))}
+
+            {/* Download every attachment on this sticky note */}
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                const label = stickyLabelOf(sticky);
+                downloadFileItems(
+                  buildFileList(label, sticky.images || [], sticky.pdfs || []),
+                  `${label} - files`
+                );
+              }}
+              className="h-10 px-2.5 rounded-lg border border-indigo-500/40 bg-indigo-600/15 hover:bg-indigo-600/25 hover:scale-105 transition shadow-sm flex items-center gap-1.5 flex-shrink-0"
+              title="Download all attachments on this sticky note"
+            >
+              <Download className="w-4 h-4 text-indigo-500" />
+              <span className="text-[10px] font-bold">
+                {(sticky.images?.length || 0) + (sticky.pdfs?.length || 0) > 1 ? 'All' : 'Save'}
+              </span>
+            </button>
           </div>
         )}
 
@@ -980,9 +1331,512 @@ const areStickyPropsEqual = (a: any, b: any) =>
   a.sticky === b.sticky &&
   a.isSelected === b.isSelected &&
   a.isColorOpen === b.isColorOpen &&
-  a.expandedStickyAttachment === b.expandedStickyAttachment;
+  a.expandedStickyAttachment === b.expandedStickyAttachment &&
+  a.lockHint === b.lockHint;
 
 const StickyNoteCard = React.memo(StickyNoteBase, areStickyPropsEqual);
+
+// Zoom state helper: zooms to `z2` keeping the point under (cx, cy) fixed.
+// (cx, cy) are measured from the center of the viewing area; z <= 1 always re-centers.
+const MIN_VIEW_ZOOM = 0.25;
+const MAX_VIEW_ZOOM = 8;
+const applyZoom = (v: { z: number; x: number; y: number }, nextZ: number, cx = 0, cy = 0) => {
+  const z2 = Math.min(MAX_VIEW_ZOOM, Math.max(MIN_VIEW_ZOOM, nextZ));
+  if (z2 === v.z) return v;
+  if (z2 <= 1) return { z: z2, x: 0, y: 0 };
+  const k = z2 / v.z;
+  return { z: z2, x: cx - k * (cx - v.x), y: cy - k * (cy - v.y) };
+};
+
+// Full-size viewer for images / PDFs from node notes and the file explorer.
+// Images support zoom (wheel / pinch / buttons / + - 0 keys) and drag-to-pan; double-click toggles 2.5x.
+const FileViewerModal = ({ items, index, onIndex, onClose }: any) => {
+  const item = items[index];
+  const count = items.length;
+  const isImage = !!item && item.kind === 'image';
+
+  const [view, setView] = useState({ z: 1, x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const isImageRef = useRef(false);
+  isImageRef.current = isImage;
+  const dragRef = useRef<any>(null);
+  const suppressClickRef = useRef(false);
+
+  const zoomBy = (factor: number) => setView((v) => applyZoom(v, v.z * factor));
+  const resetView = () => setView({ z: 1, x: 0, y: 0 });
+
+  // Start every file at "fit to window"
+  useEffect(() => {
+    setView({ z: 1, x: 0, y: 0 });
+  }, [index]);
+
+  // Keyboard: arrows to navigate, Esc to close, + / - / 0 to zoom
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const tag = (document.activeElement as any)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+      if (e.key === 'Escape') onClose();
+      else if (e.key === 'ArrowLeft' && index > 0) onIndex(index - 1);
+      else if (e.key === 'ArrowRight' && index < count - 1) onIndex(index + 1);
+      else if (isImageRef.current && (e.key === '+' || e.key === '=')) zoomBy(1.25);
+      else if (isImageRef.current && (e.key === '-' || e.key === '_')) zoomBy(1 / 1.25);
+      else if (isImageRef.current && e.key === '0') resetView();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [index, count]);
+
+  // Mouse wheel / trackpad pinch zoom toward the cursor (non-passive so the page never scrolls)
+  useEffect(() => {
+    const el = bodyRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      if (!isImageRef.current) return;
+      e.preventDefault();
+      const rect = el.getBoundingClientRect();
+      const cx = e.clientX - (rect.left + rect.width / 2);
+      const cy = e.clientY - (rect.top + rect.height / 2);
+      const factor = Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.0015));
+      setView((v) => applyZoom(v, v.z * factor, cx, cy));
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, []);
+
+  // Drag-to-pan (only while zoomed in)
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      const d = dragRef.current;
+      if (!d) return;
+      const dx = e.clientX - d.sx;
+      const dy = e.clientY - d.sy;
+      if (Math.abs(dx) + Math.abs(dy) > 3) d.moved = true;
+      setView((v) => ({ ...v, x: d.ox + dx, y: d.oy + dy }));
+    };
+    const onUp = () => {
+      const d = dragRef.current;
+      if (!d) return;
+      if (d.moved) {
+        // a drag that ends over the backdrop must not close the viewer
+        suppressClickRef.current = true;
+        setTimeout(() => (suppressClickRef.current = false), 80);
+      }
+      dragRef.current = null;
+      setDragging(false);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, []);
+
+  if (!item) return null;
+
+  return (
+    <div
+      onClick={() => {
+        if (!suppressClickRef.current) onClose();
+      }}
+      className="fixed inset-0 z-[55] flex items-center justify-center p-4 bg-black/75 backdrop-blur-sm"
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="relative w-full max-w-4xl max-h-[90vh] rounded-2xl bg-slate-900 border border-slate-700 shadow-2xl flex flex-col overflow-hidden"
+      >
+        <div className="h-12 px-4 bg-slate-950 border-b border-slate-800 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2 text-xs font-semibold text-slate-200 min-w-0">
+            {isImage ? (
+              <ImageIcon className="w-4 h-4 text-indigo-400 flex-shrink-0" />
+            ) : (
+              <FileText className="w-4 h-4 text-rose-400 flex-shrink-0" />
+            )}
+            <span className="truncate">{item.name}</span>
+            {count > 1 && (
+              <span className="text-[10px] font-mono text-slate-500 flex-shrink-0">
+                {index + 1} / {count}
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-2 flex-shrink-0">
+            {isImage && (
+              <div className="flex items-center space-x-1 p-1 rounded-xl border bg-slate-900/90 border-slate-700 text-slate-200">
+                <button
+                  onClick={() => zoomBy(1 / 1.25)}
+                  className="p-1.5 rounded-lg hover:bg-slate-800/50 transition"
+                  title="Zoom out (-)"
+                >
+                  <ZoomOut className="w-4 h-4" />
+                </button>
+                <button
+                  onClick={resetView}
+                  className="px-1.5 py-1 min-w-[48px] text-center text-[11px] font-mono rounded-lg hover:bg-slate-800/50 transition"
+                  title="Reset to fit (0)"
+                >
+                  {Math.round(view.z * 100)}%
+                </button>
+                <button
+                  onClick={() => zoomBy(1.25)}
+                  className="p-1.5 rounded-lg hover:bg-slate-800/50 transition"
+                  title="Zoom in (+)"
+                >
+                  <ZoomIn className="w-4 h-4" />
+                </button>
+              </div>
+            )}
+            <button
+              onClick={() => downloadFileItem(item)}
+              className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-100 text-xs font-semibold transition flex items-center gap-1.5"
+              title="Download this file"
+            >
+              <Download className="w-3.5 h-3.5" />
+              <span>Download</span>
+            </button>
+            <button
+              onClick={onClose}
+              className="px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold transition flex items-center gap-1.5 shadow-md"
+              title="Close viewer"
+            >
+              <Minimize2 className="w-3.5 h-3.5" />
+              <span>Shrink</span>
+            </button>
+          </div>
+        </div>
+
+        <div
+          ref={bodyRef}
+          onMouseDown={(e) => {
+            if (!isImage || view.z <= 1 || e.button !== 0) return;
+            e.preventDefault();
+            dragRef.current = { sx: e.clientX, sy: e.clientY, ox: view.x, oy: view.y, moved: false };
+            setDragging(true);
+          }}
+          onDoubleClick={(e) => {
+            if (!isImage) return;
+            if (view.z > 1) {
+              resetView();
+            } else if (bodyRef.current) {
+              const rect = bodyRef.current.getBoundingClientRect();
+              const cx = e.clientX - (rect.left + rect.width / 2);
+              const cy = e.clientY - (rect.top + rect.height / 2);
+              setView((v) => applyZoom(v, 2.5, cx, cy));
+            }
+          }}
+          className={`relative flex-1 flex items-center justify-center p-4 bg-slate-900 ${
+            isImage ? 'h-[74vh] overflow-hidden select-none' : 'overflow-auto'
+          }`}
+        >
+          {isImage ? (
+            <img
+              src={item.data}
+              alt={item.name}
+              draggable={false}
+              className="max-w-full max-h-full object-contain rounded-lg shadow-lg"
+              style={{
+                transform: `translate(${view.x}px, ${view.y}px) scale(${view.z})`,
+                transformOrigin: 'center',
+                willChange: 'transform',
+                cursor: view.z > 1 ? (dragging ? 'grabbing' : 'grab') : 'zoom-in'
+              }}
+            />
+          ) : (
+            <iframe src={item.data} title={item.name} className="w-full h-[76vh] rounded-lg border border-slate-800 bg-white" />
+          )}
+
+          {count > 1 && index > 0 && (
+            <button
+              onMouseDown={(e) => e.stopPropagation()}
+              onDoubleClick={(e) => e.stopPropagation()}
+              onClick={() => onIndex(index - 1)}
+              className="absolute left-3 top-1/2 -translate-y-1/2 p-2.5 rounded-xl bg-slate-950/85 border border-slate-700 hover:bg-slate-800 text-slate-200 shadow-lg transition"
+              title="Previous (←)"
+            >
+              <ChevronLeft className="w-5 h-5" />
+            </button>
+          )}
+          {count > 1 && index < count - 1 && (
+            <button
+              onMouseDown={(e) => e.stopPropagation()}
+              onDoubleClick={(e) => e.stopPropagation()}
+              onClick={() => onIndex(index + 1)}
+              className="absolute right-3 top-1/2 -translate-y-1/2 p-2.5 rounded-xl bg-slate-950/85 border border-slate-700 hover:bg-slate-800 text-slate-200 shadow-lg transition"
+              title="Next (→)"
+            >
+              <ChevronRight className="w-5 h-5" />
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// Collapsible tree of every uploaded file, grouped by sheet -> sticky notes / node notes
+const FileExplorerPanel = ({ tree, activeTabId, hotkeyHint, onPreview, onClose }: any) => {
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const toggle = (key: string) => setCollapsed((prev) => ({ ...prev, [key]: !prev[key] }));
+  const isOpen = (key: string) => !collapsed[key];
+
+  const withFolder = (files: any[], folder: string) => files.map((f) => ({ ...f, folder }));
+
+  const sheetFiles = (sheet: any) => [
+    ...sheet.stickies.flatMap((s: any) => withFolder(s.files, `${safeName(sheet.title)}/Sticky Notes/${safeName(s.label)}`)),
+    ...sheet.nodes.flatMap((n: any) => withFolder(n.files, `${safeName(sheet.title)}/Node Notes/${safeName(n.label)}`))
+  ];
+
+  const Chevron = ({ open }: any) =>
+    open ? <ChevronDown className="w-3.5 h-3.5 text-slate-500 flex-shrink-0" /> : <ChevronRight className="w-3.5 h-3.5 text-slate-500 flex-shrink-0" />;
+
+  const DownloadBtn = ({ onClick, title }: any) => (
+    <button
+      onClick={(e) => { e.stopPropagation(); onClick(); }}
+      className="p-1 rounded-md hover:bg-slate-700 text-slate-400 hover:text-indigo-300 transition flex-shrink-0"
+      title={title}
+    >
+      <Download className="w-3.5 h-3.5" />
+    </button>
+  );
+
+  const FileRow = ({ file, onOpen }: any) => {
+    const canPreview = !!onOpen;
+    return (
+      <div className="flex items-center gap-1.5 pl-9 pr-1 py-1 rounded-lg hover:bg-slate-800/70 group">
+        {file.kind === 'image' ? (
+          <ImageIcon className="w-3.5 h-3.5 text-indigo-400 flex-shrink-0" />
+        ) : (
+          <FileText className="w-3.5 h-3.5 text-rose-400 flex-shrink-0" />
+        )}
+        <span
+          onClick={canPreview ? onOpen : undefined}
+          className={`flex-1 truncate text-[11px] text-slate-300 ${canPreview ? 'cursor-pointer hover:text-white' : ''}`}
+          title={canPreview ? `${file.name} (click to preview)` : file.name}
+        >
+          {file.name}
+        </span>
+        <DownloadBtn onClick={() => downloadFileItem(file)} title="Download this file" />
+      </div>
+    );
+  };
+
+  const Group = ({ gKey, icon, label, files, zipName, children, depth = 0 }: any) => (
+    <div>
+      <div
+        onClick={() => toggle(gKey)}
+        style={{ paddingLeft: 8 + depth * 14 }}
+        className="flex items-center gap-1.5 pr-1 py-1.5 rounded-lg hover:bg-slate-800/70 cursor-pointer"
+      >
+        <Chevron open={isOpen(gKey)} />
+        {icon}
+        <span className="flex-1 truncate text-xs font-semibold text-slate-200">{label}</span>
+        <span className="text-[10px] font-mono text-slate-500">{files.length}</span>
+        <DownloadBtn onClick={() => downloadFileItems(files, zipName, true)} title="Download these files as a .zip" />
+      </div>
+      {isOpen(gKey) && children}
+    </div>
+  );
+
+  const allFiles = tree.sheets.flatMap((sh: any) => sheetFiles(sh));
+
+  return (
+    <div className="fixed right-16 top-1/2 -translate-y-1/2 z-30 w-72 max-h-[60vh] rounded-2xl bg-slate-900 border border-slate-800 shadow-2xl flex flex-col pointer-events-auto">
+      <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800">
+        <h3 className="text-sm font-bold flex items-center gap-2 text-white">
+          <FolderTree className="w-4 h-4 text-indigo-400" /> Uploaded Files
+          <span className="text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
+            {tree.total}
+          </span>
+        </h3>
+        <div className="flex items-center gap-1">
+          <button
+            onClick={() => downloadFileItems(allFiles, 'Free Map - all files', true)}
+            disabled={tree.total === 0}
+            className="p-1.5 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition"
+            title="Download everything as a .zip"
+          >
+            <Download className="w-4 h-4" />
+          </button>
+          <button
+            onClick={onClose}
+            className="p-1.5 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white transition"
+            title={`Close (${hotkeyHint})`}
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-y-auto p-2">
+        {tree.total === 0 ? (
+          <div className="py-8 px-4 text-center text-xs text-slate-500">
+            No uploaded files yet. Attach images or PDFs to a sticky note or a node note and they will show up here.
+          </div>
+        ) : (
+          tree.sheets
+            .filter((sh: any) => sh.count > 0)
+            .map((sh: any) => (
+              <Group
+                key={sh.tabId}
+                gKey={`sheet-${sh.tabId}`}
+                icon={<FolderTree className="w-3.5 h-3.5 text-indigo-400 flex-shrink-0" />}
+                label={sh.title}
+                files={sheetFiles(sh)}
+                zipName={sh.title}
+              >
+                {sh.stickies.length > 0 && (
+                  <Group
+                    gKey={`stk-${sh.tabId}`}
+                    depth={1}
+                    icon={<StickyNote className="w-3.5 h-3.5 text-amber-400 flex-shrink-0" />}
+                    label="Sticky Notes"
+                    files={sh.stickies.flatMap((s: any) => withFolder(s.files, safeName(s.label)))}
+                    zipName={`${sh.title} - Sticky Notes`}
+                  >
+                    {sh.stickies.map((s: any) => (
+                      <Group
+                        key={s.id}
+                        gKey={`s-${s.id}`}
+                        depth={2}
+                        icon={<StickyNote className="w-3.5 h-3.5 text-amber-400 flex-shrink-0" />}
+                        label={s.label}
+                        files={s.files}
+                        zipName={`${s.label} - files`}
+                      >
+                        {s.files.map((f: any, i: number) => (
+                          <FileRow key={`${f.kind}-${f.index}`} file={f} onOpen={() => onPreview(s.files, i)} />
+                        ))}
+                      </Group>
+                    ))}
+                  </Group>
+                )}
+                {sh.nodes.length > 0 && (
+                  <Group
+                    gKey={`nod-${sh.tabId}`}
+                    depth={1}
+                    icon={<Network className="w-3.5 h-3.5 text-emerald-400 flex-shrink-0" />}
+                    label="Node Notes"
+                    files={sh.nodes.flatMap((n: any) => withFolder(n.files, safeName(n.label)))}
+                    zipName={`${sh.title} - Node Notes`}
+                  >
+                    {sh.nodes.map((n: any) => (
+                      <Group
+                        key={n.id}
+                        gKey={`n-${n.id}`}
+                        depth={2}
+                        icon={<FileText className="w-3.5 h-3.5 text-emerald-400 flex-shrink-0" />}
+                        label={n.label}
+                        files={n.files}
+                        zipName={`${n.label} - images`}
+                      >
+                        {n.files.map((f: any, i: number) => (
+                          <FileRow key={`${f.kind}-${f.index}`} file={f} onOpen={() => onPreview(n.files, i)} />
+                        ))}
+                      </Group>
+                    ))}
+                  </Group>
+                )}
+              </Group>
+            ))
+        )}
+      </div>
+    </div>
+  );
+};
+
+// Settings: rebind every hotkey to any keyboard key or mouse button
+const SettingsModal = ({ keybinds, notice, onClose, onCapture, onRemove, onResetAction, onResetAll }: any) => (
+  <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+    <div className="w-full max-w-lg max-h-[85vh] rounded-2xl bg-slate-900 border border-slate-800 p-6 shadow-2xl flex flex-col">
+      <div className="flex items-center justify-between mb-4">
+        <h3 className="text-lg font-bold flex items-center gap-2 text-white">
+          <Settings className="w-5 h-5 text-indigo-400" /> Settings
+        </h3>
+        <button onClick={onClose} className="p-1 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white">
+          <X className="w-5 h-5" />
+        </button>
+      </div>
+
+      <div className="flex items-center gap-2 mb-2 text-xs font-semibold uppercase tracking-wider text-slate-400">
+        <Keyboard className="w-4 h-4 text-indigo-400" /> Hotkeys
+      </div>
+      <p className="text-[11px] text-slate-500 mb-3">
+        Click a key to change it, or + to add another. Any keyboard key or mouse button works except plain left click.
+      </p>
+
+      {notice && (
+        <div className="mb-3 px-3 py-2 rounded-xl bg-indigo-600/15 border border-indigo-500/30 text-[11px] text-indigo-200">
+          {notice}
+        </div>
+      )}
+
+      <div className="flex-1 overflow-y-auto pr-1 space-y-1 text-xs text-slate-300">
+        {HOTKEY_ACTIONS.map((action) => {
+          const list = keybinds[action.id] || [];
+          const isDefault =
+            list.length === DEFAULT_KEYBINDS[action.id].length &&
+            list.every((b: any, i: number) => bindingsEqual(b, DEFAULT_KEYBINDS[action.id][i]));
+          return (
+            <div key={action.id} className="flex justify-between items-center gap-3 py-1.5 border-b border-slate-800">
+              <span className="flex-1">{action.label}</span>
+              <div className="flex items-center flex-wrap justify-end gap-1.5">
+                {list.length === 0 && <span className="text-slate-500 italic">Unbound</span>}
+                {list.map((b: any, i: number) => (
+                  <span key={i} className="inline-flex items-center rounded bg-slate-800 border border-slate-700 font-mono">
+                    <button
+                      onClick={() => onCapture(action.id, i)}
+                      className="px-2 py-0.5 hover:text-white hover:bg-slate-700 rounded-l transition"
+                      title="Click to change"
+                    >
+                      {formatBinding(b)}
+                    </button>
+                    <button
+                      onClick={() => onRemove(action.id, i)}
+                      className="px-1 py-0.5 text-slate-500 hover:text-rose-400 hover:bg-slate-700 rounded-r transition"
+                      title="Remove this binding"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </span>
+                ))}
+                <button
+                  onClick={() => onCapture(action.id, 'new')}
+                  className="p-1 rounded bg-slate-800 border border-slate-700 hover:bg-slate-700 text-slate-300 hover:text-white transition"
+                  title="Add another key or mouse button"
+                >
+                  <Plus className="w-3 h-3" />
+                </button>
+                <button
+                  onClick={() => onResetAction(action.id)}
+                  disabled={isDefault}
+                  className="p-1 rounded text-slate-500 hover:text-white hover:bg-slate-800 disabled:opacity-25 disabled:cursor-not-allowed transition"
+                  title="Reset to default"
+                >
+                  <RotateCcw className="w-3 h-3" />
+                </button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="flex justify-between mt-5">
+        <button
+          onClick={onResetAll}
+          className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 font-medium text-xs transition"
+        >
+          Reset All to Defaults
+        </button>
+        <button
+          onClick={onClose}
+          className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-medium text-xs transition"
+        >
+          Done
+        </button>
+      </div>
+    </div>
+  </div>
+);
 
 export default function App() {
   // Multi-Tab Sheet State
@@ -1037,6 +1891,17 @@ export default function App() {
   const [showColorPicker, setShowColorPicker] = useState(false);
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [showHelpModal, setShowHelpModal] = useState(false);
+  const [showFileTree, setShowFileTree] = useState(false);
+  const [fileViewer, setFileViewer] = useState(null); // { items: [{ name, data, kind }], index }
+  const [showSettings, setShowSettings] = useState(false);
+  const [keybinds, setKeybinds] = useState(loadKeybinds);
+  const [captureTarget, setCaptureTarget] = useState(null); // { actionId, slot: index | 'new' }
+  const [bindNotice, setBindNotice] = useState('');
+  const captureRef = useRef(false);
+  const keybindsRef = useRef(keybinds);
+  keybindsRef.current = keybinds;
+  const hotkeyRuntime = useRef(null);
+  const suppressContextMenu = useRef(false);
   const [showMarkdownModal, setShowMarkdownModal] = useState(false);
   const [markdownContent, setMarkdownContent] = useState('');
 
@@ -1938,82 +2803,234 @@ export default function App() {
     setShowMarkdownModal(true);
   };
 
-  // Global Keydown Handler for Navigation & Editing
-  useEffect(() => {
-    const handleKeyDown = (e) => {
-      if (e.key === 'Escape' && pendingPlacementMode) {
-        e.preventDefault();
-        setPendingPlacementMode(null);
-        return;
-      }
+  // ---------- Hotkeys (rebindable via Settings) ----------
+  const hkLabel = (id) =>
+    (keybinds[id] || []).map(formatBinding).join(' / ') || 'Unbound';
+  const hkFirst = (id) => {
+    const b = (keybinds[id] || [])[0];
+    return b ? formatBinding(b) : 'Unbound';
+  };
+  const hkHint = (id) => {
+    const b = (keybinds[id] || [])[0];
+    return b ? ` (${formatBinding(b)})` : '';
+  };
 
-      // Disable shortcuts when editing text, writing a note, or typing in search bar
-      if (
-        editingNodeId ||
-        editingNoteNodeId ||
-        document.activeElement?.tagName === 'INPUT' ||
-        document.activeElement?.tagName === 'TEXTAREA'
-      ) {
-        return;
-      }
-
-      // Hotkey 'Z' or 'z' toggles overlay pop in/out (without Ctrl/Cmd modifier)
-      if ((e.key === 'z' || e.key === 'Z') && !e.ctrlKey && !e.metaKey) {
-        e.preventDefault();
-        setShowNodeOverlay((prev) => !prev);
-        return;
-      }
-
-      // Hotkey 'L' or 'l' toggles position lock on the currently selected node or sticky note
-      if (e.key === 'l' || e.key === 'L') {
-        if (!e.ctrlKey && !e.metaKey) {
-          if (selectedStickyId) {
-            e.preventDefault();
-            const targetSticky = stickyNotes.find((s) => s.id === selectedStickyId);
-            if (targetSticky) updateStickyNote(selectedStickyId, { isPinned: !targetSticky.isPinned });
-            return;
-          }
-          if (selectedNodeId) {
-            e.preventDefault();
-            toggleLockNode(selectedNodeId);
-            return;
-          }
+  // Runs a hotkey action. Returns true if it did something (so the browser default is blocked)
+  const runHotkeyAction = (actionId) => {
+    switch (actionId) {
+      case 'cancelPlacement':
+        if (pendingPlacementMode) {
+          setPendingPlacementMode(null);
+          return true;
         }
-      }
-
-      // Undo / Redo shortcuts
-	  const zKey = e.key.toLowerCase();
-      if ((e.ctrlKey || e.metaKey) && (zKey === 'z' || zKey === 'y')) {
-        e.preventDefault();
-        if (zKey === 'y' || e.shiftKey) redo();
-        else undo();
-        return;
-      }
-
-      // Delete selected sticky note
-      if (selectedStickyId && (e.key === 'Delete' || e.key === 'Backspace')) {
-        e.preventDefault();
-        deleteStickyNote(selectedStickyId);
-        return;
-      }
-
-      if (!selectedNodeId) return;
-
-      if (e.key === 'Tab') {
-        e.preventDefault();
+        return false;
+      case 'toggleOverlay':
+        setShowNodeOverlay((prev) => !prev);
+        return true;
+      case 'toggleFileTree':
+        setShowFileTree((prev) => !prev);
+        return true;
+      case 'openSettings':
+        setShowSettings((prev) => !prev);
+        return true;
+      case 'toggleLock':
+        if (selectedStickyId) {
+          const targetSticky = stickyNotes.find((s) => s.id === selectedStickyId);
+          if (targetSticky) updateStickyNote(selectedStickyId, { isPinned: !targetSticky.isPinned });
+          return true;
+        }
+        if (selectedNodeId) {
+          toggleLockNode(selectedNodeId);
+          return true;
+        }
+        return false;
+      case 'undo':
+        undo();
+        return true;
+      case 'redo':
+        redo();
+        return true;
+      case 'deleteSelected':
+        if (selectedStickyId) {
+          deleteStickyNote(selectedStickyId);
+          return true;
+        }
+        if (selectedNodeId) {
+          deleteNode(selectedNodeId);
+          return true;
+        }
+        return false;
+      case 'addChild':
+        if (!selectedNodeId) return false;
         addChildNode(selectedNodeId);
-      } else if (e.key === 'Enter') {
-        e.preventDefault();
+        return true;
+      case 'addSibling':
+        if (!selectedNodeId) return false;
         addSiblingNode(selectedNodeId);
-      } else if (e.key === 'Delete' || e.key === 'Backspace') {
+        return true;
+      default:
+        return false;
+    }
+  };
+
+  // Keep the listeners below pointed at the latest state without re-subscribing
+  useEffect(() => {
+    hotkeyRuntime.current = {
+      run: runHotkeyAction,
+      keybinds,
+      blocked: !!(editingNodeId || editingNoteNodeId || fileViewer || expandedStickyAttachment),
+      settingsOpen: showSettings,
+      pendingPlacementMode
+    };
+  });
+
+  // Persist custom keybinds
+  useEffect(() => {
+    try {
+      localStorage.setItem(KEYBINDS_STORAGE_KEY, JSON.stringify(keybinds));
+    } catch (err) {
+      /* storage unavailable: bindings simply won't persist */
+    }
+  }, [keybinds]);
+
+  // Global keyboard + mouse-button hotkeys
+  useEffect(() => {
+    const findAction = (test) => {
+      const rt = hotkeyRuntime.current;
+      if (!rt) return null;
+      for (const id of Object.keys(rt.keybinds)) {
+        if (rt.keybinds[id].some(test)) return id;
+      }
+      return null;
+    };
+    const typingNow = () => {
+      const tag = document.activeElement?.tagName;
+      return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+    };
+
+    const onKeyDown = (e) => {
+      const rt = hotkeyRuntime.current;
+      if (!rt || captureRef.current) return;
+
+      // Placement cancel works even while a field is focused (as before)
+      const id = findAction((b) => matchesKeyEvent(b, e));
+      if (id === 'cancelPlacement') {
+        if (rt.pendingPlacementMode && rt.run(id)) e.preventDefault();
+        return;
+      }
+      if (rt.blocked || typingNow() || rt.settingsOpen) return;
+      if (id && rt.run(id)) e.preventDefault();
+    };
+
+    const onMouseDown = (e) => {
+      const rt = hotkeyRuntime.current;
+      suppressContextMenu.current = false;
+      if (!rt || captureRef.current || e.button === 0) return;
+      if (rt.blocked || typingNow() || rt.settingsOpen) return;
+      const id = findAction((b) => matchesMouseEvent(b, e));
+      if (id && rt.run(id)) {
         e.preventDefault();
-        deleteNode(selectedNodeId);
+        e.stopPropagation(); // don't also start a canvas pan / click
+        if (e.button === 2) suppressContextMenu.current = true;
+      }
+    };
+    const onMouseUp = (e) => {
+      if (captureRef.current) return;
+      // Stops side buttons from triggering browser back / forward
+      if (e.button === 3 || e.button === 4) e.preventDefault();
+    };
+    const onContextMenu = (e) => {
+      if (suppressContextMenu.current) {
+        e.preventDefault();
+        suppressContextMenu.current = false;
       }
     };
 
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedNodeId, selectedStickyId, stickyNotes, editingNodeId, editingNoteNodeId, rootNodes, historyIndex, history, pendingPlacementMode]);
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('mousedown', onMouseDown, true);
+    window.addEventListener('mouseup', onMouseUp, true);
+    window.addEventListener('contextmenu', onContextMenu, true);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('mousedown', onMouseDown, true);
+      window.removeEventListener('mouseup', onMouseUp, true);
+      window.removeEventListener('contextmenu', onContextMenu, true);
+    };
+  }, []);
+
+  // Rebinding: listen for the next key / mouse button while a capture is active
+  const assignBinding = (actionId, slot, binding) => {
+    const current = keybindsRef.current;
+    const next = {};
+    const stolen = [];
+    Object.keys(current).forEach((id) => {
+      if (id === actionId) {
+        next[id] = [...current[id]];
+        return;
+      }
+      const kept = current[id].filter((b) => !bindingsEqual(b, binding));
+      if (kept.length !== current[id].length) {
+        stolen.push(HOTKEY_ACTIONS.find((a) => a.id === id)?.label || id);
+      }
+      next[id] = kept;
+    });
+    const list = next[actionId];
+    if (slot === 'new' || slot >= list.length) list.push(binding);
+    else list[slot] = binding;
+    next[actionId] = list.filter((b, i) => list.findIndex((x) => bindingsEqual(x, b)) === i);
+    setKeybinds(next);
+    setBindNotice(
+      stolen.length
+        ? `${formatBinding(binding)} was moved here from: ${stolen.join(', ')}.`
+        : `Set to ${formatBinding(binding)}.`
+    );
+  };
+
+  useEffect(() => {
+    if (!captureTarget) return;
+    captureRef.current = true;
+
+    const finish = (binding) => {
+      assignBinding(captureTarget.actionId, captureTarget.slot, binding);
+      setCaptureTarget(null);
+    };
+    const onKey = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (['Control', 'Shift', 'Alt', 'Meta', 'AltGraph', 'CapsLock'].includes(e.key)) return;
+      finish(bindingFromKeyEvent(e));
+    };
+    const onMouse = (e) => {
+      if (e.button === 0) return; // left click stays a normal click (Cancel button etc.)
+      e.preventDefault();
+      e.stopPropagation();
+      finish(bindingFromMouseEvent(e));
+    };
+    const blockMouse = (e) => {
+      if (e.button !== 0) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    };
+    const blockMenu = (e) => e.preventDefault();
+
+    window.addEventListener('keydown', onKey, true);
+    window.addEventListener('mousedown', onMouse, true);
+    window.addEventListener('mouseup', blockMouse, true);
+    window.addEventListener('auxclick', blockMouse, true);
+    window.addEventListener('contextmenu', blockMenu, true);
+    return () => {
+      window.removeEventListener('keydown', onKey, true);
+      window.removeEventListener('mousedown', onMouse, true);
+      window.removeEventListener('mouseup', blockMouse, true);
+      window.removeEventListener('auxclick', blockMouse, true);
+      window.removeEventListener('contextmenu', blockMenu, true);
+      captureRef.current = false;
+    };
+  }, [captureTarget]);
+
+  // Uploaded-files tree (all sheets)
+  const fileTree = useMemo(() => buildFileTree(tabs), [tabs]);
 
   // Tree Layout Engine supporting Multiple Independent Parent Roots on Same Sheet
   const calculateTreeLayout = useCallback(() => {
@@ -2180,7 +3197,7 @@ export default function App() {
               onClick={undo}
               disabled={historyIndex <= 0}
               className="p-1.5 rounded-xl hover:bg-slate-800 text-slate-300 disabled:opacity-30 transition"
-              title="Undo (Ctrl+Z)"
+              title={`Undo${hkHint('undo')}`}
             >
               <RotateCcw className="w-4 h-4" />
             </button>
@@ -2189,7 +3206,7 @@ export default function App() {
 			  onClick={redo}
               disabled={historyIndex >= history.length - 1}
               className="p-1.5 rounded-xl hover:bg-slate-800 text-slate-300 disabled:opacity-30 transition"
-              title="Redo (Ctrl+Shift+Z / Ctrl+Y)"
+              title={`Redo${hkHint('redo')}`}
             >
               <RotateCw className="w-4 h-4" />
             </button>
@@ -2246,6 +3263,14 @@ export default function App() {
               title="Keyboard Shortcuts & Help"
             >
               <HelpCircle className="w-4 h-4" />
+            </button>
+
+            <button
+              onClick={() => setShowSettings(true)}
+              className="p-2 rounded-xl hover:bg-slate-800 text-slate-300 transition"
+              title={`Settings & Hotkeys${hkHint('openSettings')}`}
+            >
+              <Settings className="w-4 h-4" />
             </button>
           </div>
         </div>
@@ -2364,7 +3389,7 @@ export default function App() {
               <button
                 onClick={() => addChildNode(selectedNodeId, false)}
                 className="px-2.5 py-1.5 rounded-xl hover:bg-indigo-600 bg-indigo-600/20 border border-indigo-500/40 text-indigo-200 hover:text-white transition flex items-center text-xs font-semibold gap-1"
-                title="Add Child Node (Tab)"
+                title={`Add Child Node${hkHint('addChild')}`}
               >
                 <Plus className="w-3.5 h-3.5" /> Child
               </button>
@@ -2379,7 +3404,7 @@ export default function App() {
                 onClick={() => addSiblingNode(selectedNodeId, false)}
                 disabled={rootNodes.some((r) => r.id === selectedNodeId)}
                 className="px-2 py-1.5 rounded-xl hover:bg-slate-800 bg-slate-800/60 border border-slate-700/60 text-slate-200 hover:text-white transition flex items-center text-xs font-semibold gap-1 disabled:opacity-30 disabled:cursor-not-allowed"
-                title="Add Sibling Node (Enter) - Child nodes only"
+                title={`Add Sibling Node${hkHint('addSibling')} - Child nodes only`}
               >
                 <ArrowRight className="w-3.5 h-3.5" /> Sibling
               </button>
@@ -2411,7 +3436,7 @@ export default function App() {
                     ? 'bg-rose-600/25 border-rose-500/60 text-rose-300'
                     : 'hover:bg-slate-800 border-slate-700/50 text-slate-200'
                 }`}
-                title="Lock / Unlock Node Position (L)"
+                title={`Lock / Unlock Node Position${hkHint('toggleLock')}`}
               >
                 {findNode(rootNodes, selectedNodeId)?.isLocked ? <Lock className="w-4 h-4" /> : <Unlock className="w-4 h-4" />}
               </button>
@@ -2679,6 +3704,7 @@ export default function App() {
               expandedStickyAttachment={
                 expandedStickyAttachment?.stickyId === sticky.id ? expandedStickyAttachment : null
               }
+              lockHint={hkHint('toggleLock')}
               ctx={nodeCtx}
             />
           ))}
@@ -2693,10 +3719,10 @@ export default function App() {
                 ? 'bg-slate-900/90 border-slate-700 text-slate-200 hover:bg-slate-800'
                 : 'bg-indigo-600/90 border-indigo-500 text-white hover:bg-indigo-500 shadow-indigo-600/30'
             }`}
-            title="Toggle Node Action Overlay (Shortcut: Z)"
+            title={`Toggle Node Action Overlay${hkHint('toggleOverlay')}`}
           >
             {showNodeOverlay ? <EyeOff className="w-4 h-4 text-slate-400" /> : <Eye className="w-4 h-4 text-indigo-200" />}
-            <span>{showNodeOverlay ? 'Hide Overlay (Z)' : 'Show Overlay (Z)'}</span>
+            <span>{showNodeOverlay ? 'Hide Overlay' : 'Show Overlay'} ({hkFirst('toggleOverlay')})</span>
           </button>
 
           <button
@@ -2734,6 +3760,36 @@ export default function App() {
           </div>
         </div>
 
+        {/* File Explorer: small always-visible button at center right */}
+        <div className="fixed right-6 top-1/2 -translate-y-1/2 z-20 pointer-events-auto">
+          <button
+            onClick={() => setShowFileTree((prev) => !prev)}
+            className={`relative p-2 rounded-xl border shadow-lg transition ${
+              showFileTree
+                ? 'bg-indigo-600/90 border-indigo-500 text-white hover:bg-indigo-500 shadow-indigo-600/30'
+                : 'bg-slate-900/90 border-slate-700 text-slate-200 hover:bg-slate-800'
+            }`}
+            title={`Uploaded Files Explorer${hkHint('toggleFileTree')}`}
+          >
+            <FolderTree className={`w-4 h-4 ${showFileTree ? 'text-indigo-100' : 'text-indigo-400'}`} />
+            {fileTree.total > 0 && (
+              <span className="absolute -top-1.5 -right-1.5 min-w-[16px] h-4 px-1 rounded-full bg-indigo-600 border border-indigo-300/40 text-white text-[9px] font-bold flex items-center justify-center">
+                {fileTree.total}
+              </span>
+            )}
+          </button>
+        </div>
+
+        {showFileTree && (
+          <FileExplorerPanel
+            tree={fileTree}
+            activeTabId={activeTabId}
+            hotkeyHint={hkFirst('toggleFileTree')}
+            onPreview={(files, index) => setFileViewer({ items: files, index })}
+            onClose={() => setShowFileTree(false)}
+          />
+        )}
+
         {/* Quick Help Floating Tip Banner */}
         <div className="fixed bottom-6 left-6 hidden md:flex items-center space-x-3 px-4 py-2 rounded-xl border shadow-lg bg-slate-900/80 border-slate-800 text-xs text-slate-400 z-20 pointer-events-auto">
           <span className="flex items-center gap-1 font-medium text-slate-300">
@@ -2747,11 +3803,87 @@ export default function App() {
           </span>
           <span>•</span>
           <span className="flex items-center gap-1 font-medium text-slate-300">
-            <kbd className="px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono text-[11px]">Tab</kbd>
+            <kbd className="px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono text-[11px]">{hkFirst('addChild')}</kbd>
             Child
           </span>
         </div>
       </div>
+
+      {/* Full-size viewer for node-note images and explorer files */}
+      {fileViewer && (
+        <FileViewerModal
+          items={fileViewer.items}
+          index={fileViewer.index}
+          onIndex={(i) => setFileViewer((prev) => (prev ? { ...prev, index: i } : prev))}
+          onClose={() => setFileViewer(null)}
+        />
+      )}
+
+      {/* Settings Modal */}
+      {showSettings && (
+        <SettingsModal
+          keybinds={keybinds}
+          notice={bindNotice}
+          onClose={() => {
+            setShowSettings(false);
+            setCaptureTarget(null);
+            setBindNotice('');
+          }}
+          onCapture={(actionId, slot) => {
+            setBindNotice('');
+            setCaptureTarget({ actionId, slot });
+          }}
+          onRemove={(actionId, index) => {
+            setKeybinds((prev) => ({ ...prev, [actionId]: prev[actionId].filter((_, i) => i !== index) }));
+            setBindNotice('');
+          }}
+          onResetAction={(actionId) => {
+            const defaults = DEFAULT_KEYBINDS[actionId].map((b) => ({ ...b }));
+            const next = {};
+            Object.keys(keybinds).forEach((id) => {
+              next[id] =
+                id === actionId
+                  ? defaults
+                  : keybinds[id].filter((b) => !defaults.some((d) => bindingsEqual(d, b)));
+            });
+            setKeybinds(next);
+            setBindNotice('');
+          }}
+          onResetAll={() => {
+            const next = {};
+            Object.keys(DEFAULT_KEYBINDS).forEach((id) => (next[id] = DEFAULT_KEYBINDS[id].map((b) => ({ ...b }))));
+            setKeybinds(next);
+            setBindNotice('All hotkeys were reset to their defaults.');
+          }}
+        />
+      )}
+
+      {/* Waiting for a new key / mouse button */}
+      {captureTarget && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+          <div className="w-full max-w-sm rounded-2xl bg-slate-900 border border-slate-800 p-6 shadow-2xl flex flex-col items-center text-center">
+            <div className="w-12 h-12 rounded-xl bg-indigo-500/15 border border-indigo-500/30 flex items-center justify-center mb-3">
+              <Keyboard className="w-6 h-6 text-indigo-400" />
+            </div>
+            <h3 className="text-base font-bold text-white mb-1">Press a key or mouse button</h3>
+            <p className="text-xs text-slate-400 mb-1">
+              Setting hotkey for{' '}
+              <span className="font-semibold text-slate-200">
+                {HOTKEY_ACTIONS.find((a) => a.id === captureTarget.actionId)?.label}
+              </span>
+            </p>
+            <p className="text-[11px] text-slate-500 mb-4">
+              Hold Ctrl, Alt or Shift for combos. Plain left click is reserved. Esc can be assigned too.
+            </p>
+            <button
+              onClick={() => setCaptureTarget(null)}
+              className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 font-medium text-xs transition"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Help / Shortcuts Modal */}
       {showHelpModal && (
@@ -2771,27 +3903,35 @@ export default function App() {
             <div className="space-y-3 text-xs text-slate-300">
               <div className="flex justify-between items-center py-1.5 border-b border-slate-800">
                 <span>Add Child Node</span>
-                <kbd className="px-2 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono">Tab</kbd>
+                <kbd className="px-2 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono">{hkLabel('addChild')}</kbd>
               </div>
               <div className="flex justify-between items-center py-1.5 border-b border-slate-800">
                 <span>Add Sibling Node</span>
-                <kbd className="px-2 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono">Enter</kbd>
+                <kbd className="px-2 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono">{hkLabel('addSibling')}</kbd>
               </div>
               <div className="flex justify-between items-center py-1.5 border-b border-slate-800">
                 <span>Lock / Unlock Node Position</span>
-                <kbd className="px-2 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono">L</kbd>
+                <kbd className="px-2 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono">{hkLabel('toggleLock')}</kbd>
               </div>
               <div className="flex justify-between items-center py-1.5 border-b border-slate-800">
                 <span>Toggle Action Overlay</span>
-                <kbd className="px-2 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono">Z</kbd>
+                <kbd className="px-2 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono">{hkLabel('toggleOverlay')}</kbd>
               </div>
               <div className="flex justify-between items-center py-1.5 border-b border-slate-800">
                 <span>Delete Selected Node</span>
-                <kbd className="px-2 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono">Delete / Backspace</kbd>
+                <kbd className="px-2 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono">{hkLabel('deleteSelected')}</kbd>
               </div>
               <div className="flex justify-between items-center py-1.5 border-b border-slate-800">
                 <span>Undo / Redo</span>
-                <kbd className="px-2 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono">Ctrl+Z / Ctrl+Shift+Z</kbd>
+                <kbd className="px-2 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono">{hkLabel('undo')} / {hkLabel('redo')}</kbd>
+              </div>
+              <div className="flex justify-between items-center py-1.5 border-b border-slate-800">
+                <span>Open File Explorer</span>
+                <kbd className="px-2 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono">{hkLabel('toggleFileTree')}</kbd>
+              </div>
+              <div className="flex justify-between items-center py-1.5 border-b border-slate-800">
+                <span>Open Settings</span>
+                <kbd className="px-2 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono">{hkLabel('openSettings')}</kbd>
               </div>
               <div className="flex justify-between items-center py-1.5 border-b border-slate-800">
                 <span>Edit Node Label</span>
@@ -2852,7 +3992,7 @@ export default function App() {
       {/* Note Editor Modal */}
       {editingNoteNodeId && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
-          <div className="w-full max-w-md rounded-2xl bg-slate-900 border border-slate-800 p-6 shadow-2xl flex flex-col max-h-[85vh] overflow-y-auto">
+          <div className="w-full max-w-lg rounded-2xl bg-slate-900 border border-slate-800 p-6 shadow-2xl flex flex-col max-h-[85vh] overflow-y-auto">
             <div className="flex items-center justify-between mb-3">
               <h3 className="text-base font-bold flex items-center gap-2 text-white">
                 <FileText className="w-5 h-5 text-amber-400" /> Topic Note & Images
@@ -2901,22 +4041,60 @@ export default function App() {
             </div>
 
             {/* Attached Image Previews Grid */}
-            {noteImages.length > 0 && (
-              <div className="mb-3 grid grid-cols-5 gap-2 bg-slate-950 p-2 rounded-xl border border-slate-800">
-                {noteImages.map((imgSrc, idx) => (
-                  <div key={idx} className="relative group aspect-square rounded-lg overflow-hidden border border-slate-800 bg-slate-900">
-                    <img src={imgSrc} alt={`Attachment ${idx + 1}`} className="w-full h-full object-cover" />
+            {noteImages.length > 0 && (() => {
+              const ownerNode = findNode(rootNodes, editingNoteNodeId);
+              const noteLabel = ((ownerNode && ownerNode.text) || '').trim() || 'Node note';
+              const noteFiles = buildFileList(noteLabel, noteImages, []);
+              return (
+                <div className="mb-3 bg-slate-950 p-2 rounded-xl border border-slate-800">
+                  <div className="flex items-center justify-between px-0.5 pb-2 text-[11px] text-slate-400">
+                    <span>
+                      {noteImages.length} image{noteImages.length === 1 ? '' : 's'} attached
+                    </span>
                     <button
-                      onClick={() => removeNoteImage(idx)}
-                      className="absolute top-0.5 right-0.5 p-0.5 rounded-full bg-slate-900/80 text-rose-400 hover:bg-rose-600 hover:text-white transition opacity-0 group-hover:opacity-100"
-                      title="Remove Image"
+                      onClick={() => downloadFileItems(noteFiles, `${noteLabel} - images`)}
+                      className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-indigo-300 text-[11px] font-medium transition flex items-center gap-1 border border-slate-700/60"
+                      title="Download all images on this note"
                     >
-                      <X className="w-3 h-3" />
+                      <Download className="w-3 h-3" />
+                      {noteImages.length > 1 ? 'Download All' : 'Download'}
                     </button>
                   </div>
-                ))}
-              </div>
-            )}
+                  <div className="grid grid-cols-4 gap-2.5">
+                    {noteImages.map((imgSrc, idx) => (
+                      <div
+                        key={idx}
+                        onClick={() => setFileViewer({ items: noteFiles, index: idx })}
+                        className="relative group aspect-square rounded-xl overflow-hidden border border-slate-800 bg-slate-900 cursor-zoom-in hover:border-indigo-500/60 hover:scale-[1.03] transition"
+                        title="Click to enlarge"
+                      >
+                        <img src={imgSrc} alt={`Attachment ${idx + 1}`} className="w-full h-full object-cover" />
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (noteFiles[idx]) downloadFileItem(noteFiles[idx]);
+                          }}
+                          className="absolute bottom-1 left-1 p-1.5 rounded-full bg-slate-900/85 text-indigo-300 hover:bg-indigo-600 hover:text-white transition opacity-0 group-hover:opacity-100"
+                          title="Download Image"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            removeNoteImage(idx);
+                          }}
+                          className="absolute top-1 right-1 p-1.5 rounded-full bg-slate-900/85 text-rose-400 hover:bg-rose-600 hover:text-white transition opacity-0 group-hover:opacity-100"
+                          title="Remove Image"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })()}
 
             <textarea
               value={noteText}
@@ -3009,14 +4187,28 @@ export default function App() {
                   )}
                 </div>
 
-                <button
-                  onClick={() => setExpandedStickyAttachment(null)}
-                  className="px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold transition flex items-center gap-1.5 shadow-md"
-                  title="Shrink back to icon"
-                >
-                  <Minimize2 className="w-3.5 h-3.5" />
-                  <span>Shrink</span>
-                </button>
+                <div className="flex items-center gap-2 flex-shrink-0">
+                  <button
+                    onClick={() => {
+                      const files = buildFileList(stickyLabelOf(targetSticky), targetSticky.images || [], targetSticky.pdfs || []);
+                      const file = files.find((f) => f.kind === expandedStickyAttachment.type && f.index === expandedStickyAttachment.index);
+                      if (file) downloadFileItem(file);
+                    }}
+                    className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-100 text-xs font-semibold transition flex items-center gap-1.5"
+                    title="Download this file"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>Download</span>
+                  </button>
+                  <button
+                    onClick={() => setExpandedStickyAttachment(null)}
+                    className="px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold transition flex items-center gap-1.5 shadow-md"
+                    title="Shrink back to icon"
+                  >
+                    <Minimize2 className="w-3.5 h-3.5" />
+                    <span>Shrink</span>
+                  </button>
+                </div>
               </div>
 
               {/* Viewer Body */}
